@@ -16,7 +16,7 @@ static void showLoadedAlert(void) {
         SEL alertSel = sel_registerName("alertControllerWithTitle:message:preferredStyle:");
         id alert = ((id (*)(id, SEL, id, id, long))objc_msgSend)(
             (id)AlertController, alertSel,
-            @"Payload Loaded! 🎉",
+            @"Payload Loaded!",
             @"ExamplePayload.dylib was successfully injected and is running.",
             1 /* UIAlertControllerStyleAlert */
         );
@@ -67,7 +67,7 @@ static void showLoadedAlert(void) {
 __attribute__((constructor))
 static void PayloadInit(void) {
     @autoreleasepool {
-        NSLog(@"[Payload] ★ ExamplePayload loaded! PID %d", getpid());
+        NSLog(@"[Payload] ExamplePayload loaded, PID %d", getpid());
 
         // If the app is already running (loaded via TweakLoader at launch),
         // we can show the alert after a brief delay to let the UI settle.
