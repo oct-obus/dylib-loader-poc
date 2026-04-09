@@ -17,7 +17,7 @@ static void showLoadedAlert(void) {
         id alert = ((id (*)(id, SEL, id, id, long))objc_msgSend)(
             (id)AlertController, alertSel,
             @"Payload Loaded!",
-            @"ExamplePayload.dylib was successfully injected and is running.",
+            @"ExamplePayload.dylib injected and running.",
             1 /* UIAlertControllerStyleAlert */
         );
 
@@ -30,7 +30,7 @@ static void showLoadedAlert(void) {
         ((void (*)(id, SEL, id))objc_msgSend)(alert, sel_registerName("addAction:"), okAction);
 
         // Find the key window's root view controller and present
-        // Try UIApplication.shared.connectedScenes → UIWindowScene → keyWindow (iOS 15+)
+        // Try UIApplication.shared.connectedScenes, UIWindowScene, keyWindow (iOS 15+)
         id app = ((id (*)(id, SEL))objc_msgSend)(objc_getClass("UIApplication"), sel_registerName("sharedApplication"));
         id scenes = ((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("connectedScenes"));
         id presenter = nil;
@@ -61,7 +61,7 @@ static void showLoadedAlert(void) {
 }
 
 // ============================================================================
-// Constructor — fires when this dylib is loaded
+// Constructor - fires when this dylib is loaded
 // ============================================================================
 
 __attribute__((constructor))

@@ -33,7 +33,6 @@
 // Colors
 #define COLOR_ACCENT    0x00FF88
 #define COLOR_INFO      0x55AAFF
-#define COLOR_WARNING   0xFFBB33
 #define COLOR_ERROR     0xFF4444
 #define COLOR_BG        0x1A1A2E
 
@@ -460,22 +459,6 @@ static void showInfo(NSString *msg) {
         if (progressBar) {
             ((void (*)(id, SEL, id))objc_msgSend)(progressBar, NSSelectorFromString(@"setProgressTintColor:"),
                 colorFromHex(COLOR_INFO, 1.0));
-        }
-    });
-}
-
-__attribute__((unused))
-static void showWarning(NSString *msg, NSString *detail) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (statusLabel) {
-            ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setText:"), msg);
-            ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setTextColor:"),
-                colorFromHex(COLOR_WARNING, 1.0));
-        }
-        if (detail && detailLabel) {
-            ((void (*)(id, SEL, id))objc_msgSend)(detailLabel, NSSelectorFromString(@"setText:"), detail);
-            ((void (*)(id, SEL, id))objc_msgSend)(detailLabel, NSSelectorFromString(@"setTextColor:"),
-                colorFromHex(COLOR_WARNING, 0.7));
         }
     });
 }
@@ -945,8 +928,16 @@ static void DylibLoaderInit(void) {
                     logMessage(@"Bundle filter matched: %@", currentBundle);
                 }
 
-                NSInteger remoteVersion = [manifest[@"version"] integerValue];
-                NSString *downloadURL = manifest[@"url"];
+                NSInteger remoteVersion = 0;
+                id versionVal = manifest[@"version"];
+                if ([versionVal isKindOfClass:[NSNumber class]]) {
+                    remoteVersion = [versionVal integerValue];
+                }
+                NSString *downloadURL = nil;
+                id urlVal = manifest[@"url"];
+                if ([urlVal isKindOfClass:[NSString class]] && [urlVal length] > 0) {
+                    downloadURL = urlVal;
+                }
                 NSInteger localVersion = getLocalVersion();
 
                 // Up to date and loaded
@@ -979,7 +970,7 @@ static void DylibLoaderInit(void) {
 
                 // New version available
                 logMessage(@"Update available: v%ld -> v%ld", (long)localVersion, (long)remoteVersion);
-                if (!downloadURL || ![downloadURL isKindOfClass:[NSString class]] || downloadURL.length == 0) {
+                if (!downloadURL) {
                     logMessage(@"ERROR: Manifest has no valid download URL");
                     dispatch_async(dispatch_get_main_queue(), ^{
                         createFloatingPanel();
