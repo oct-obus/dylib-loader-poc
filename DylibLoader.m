@@ -21,8 +21,9 @@
 // Configuration
 // ============================================================================
 
-#define PAYLOAD_URL @"https://raw.githubusercontent.com/oct-obus/dylib-loader-poc/master/ExamplePayload.dylib"
+#define MANIFEST_URL @"https://raw.githubusercontent.com/oct-obus/dylib-loader-poc/master/payload.json"
 #define PAYLOAD_FILENAME @"cached_payload.dylib"
+#define VERSION_KEY @"DylibLoaderPayloadVersion"
 #define LOG_FILENAME @"dylib_loader.log"
 
 // UI config
@@ -546,8 +547,54 @@ static BOOL loadPayloadFromPath(NSString *path) {
     return NO;
 }
 
-static void downloadAndLoadPayload(void) {
-    logMessage(@"Starting async download from: %@", PAYLOAD_URL);
+// ============================================================================
+// Manifest + Update Check
+// ============================================================================
+
+static NSInteger getLocalVersion(void) {
+    return [[NSUserDefaults standardUserDefaults] integerForKey:VERSION_KEY];
+}
+
+static void setLocalVersion(NSInteger version) {
+    [[NSUserDefaults standardUserDefaults] setInteger:version forKey:VERSION_KEY];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+// Returns: { "version": N, "url": "..." } or nil on error
+static NSDictionary *fetchManifest(void) {
+    NSURL *url = [NSURL URLWithString:MANIFEST_URL];
+    NSURLRequest *req = [NSURLRequest requestWithURL:url
+                                         cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                     timeoutInterval:10.0];
+
+    __block NSData *resultData = nil;
+    __block NSError *resultError = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            resultData = data;
+            resultError = error;
+            dispatch_semaphore_signal(sem);
+        }];
+    [task resume];
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+
+    if (resultError || !resultData) {
+        logMessage(@"Manifest fetch failed: %@", resultError.localizedDescription ?: @"timeout/no data");
+        return nil;
+    }
+    NSError *parseErr = nil;
+    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:resultData options:0 error:&parseErr];
+    if (parseErr || ![json isKindOfClass:[NSDictionary class]]) {
+        logMessage(@"Manifest parse failed: %@", parseErr.localizedDescription ?: @"not a dict");
+        return nil;
+    }
+    return json;
+}
+
+static void downloadPayloadFromURL(NSString *urlString) {
+    logMessage(@"Starting download from: %@", urlString);
     updateOverlayStatus(@"Connecting...");
 
     DLDownloadDelegate *delegate = [[DLDownloadDelegate alloc] init];
@@ -593,7 +640,7 @@ static void downloadAndLoadPayload(void) {
     NSURLSession *session = [NSURLSession sessionWithConfiguration:config
                                                           delegate:delegate
                                                      delegateQueue:nil];
-    NSURLSessionDownloadTask *task = [session downloadTaskWithURL:[NSURL URLWithString:PAYLOAD_URL]];
+    NSURLSessionDownloadTask *task = [session downloadTaskWithURL:[NSURL URLWithString:urlString]];
     [task resume];
 
     // Wait synchronously for download to complete (blocks constructor)
@@ -602,7 +649,7 @@ static void downloadAndLoadPayload(void) {
     if (success) {
         dismissOverlay(1.2);
     } else {
-        dismissOverlay(5.0); // Show error longer so user can read it
+        dismissOverlay(5.0);
     }
 }
 
@@ -620,84 +667,119 @@ static void DylibLoaderInit(void) {
         payloadCachePath = [docsDir stringByAppendingPathComponent:PAYLOAD_FILENAME];
 
         logMessage(@"========================================");
-        logMessage(@"DylibLoader starting");
+        logMessage(@"DylibLoader starting (manifest-based)");
         logMessage(@"Process: %@ (PID %d)", [[NSProcessInfo processInfo] processName], getpid());
         logMessage(@"Bundle: %@", [[NSBundle mainBundle] bundleIdentifier]);
-        logMessage(@"Documents: %@", docsDir);
-        logMessage(@"Cache path: %@", payloadCachePath);
+        logMessage(@"Local payload version: %ld", (long)getLocalVersion());
 
-        // Check if payload already in Tweaks folder and signed (from previous LC launch)
+        // Step 1: Try loading from Tweaks folder (already signed by LC)
         NSString *tweaksFolder = findTweaksFolder();
         NSString *tweaksPayload = tweaksFolder ?
             [tweaksFolder stringByAppendingPathComponent:@"DylibLoaderPayload.dylib"] : nil;
+
+        BOOL payloadLoaded = NO;
         if (tweaksPayload && [[NSFileManager defaultManager] fileExistsAtPath:tweaksPayload]) {
-            logMessage(@"Payload in Tweaks folder, trying to load: %@", tweaksPayload);
+            logMessage(@"Payload in Tweaks, trying to load: %@", tweaksPayload);
             if (tryDlopen(tweaksPayload)) {
-                logMessage(@"✓ Payload active (loaded from Tweaks folder)");
-                logMessage(@"========================================");
-                // Brief success indicator on main thread
-                [[NSNotificationCenter defaultCenter]
-                    addObserverForName:@"UIApplicationDidFinishLaunchingNotification"
-                                object:nil queue:[NSOperationQueue mainQueue]
-                            usingBlock:^(NSNotification *note) {
-                    createOverlayUI();
-                    showOverlaySuccess();
-                    dismissOverlay(1.2);
-                }];
-                return;
+                logMessage(@"✓ Payload active from Tweaks folder");
+                payloadLoaded = YES;
+            } else {
+                logMessage(@"Payload in Tweaks but unsigned — needs LC relaunch to sign");
             }
-            logMessage(@"Payload in Tweaks but not yet signed — will be signed on next LC launch");
         }
 
-        // Try cached payload (from previous download)
-        if ([[NSFileManager defaultManager] fileExistsAtPath:payloadCachePath]) {
-            logMessage(@"Found cached payload");
+        // Step 2: Try cached payload
+        if (!payloadLoaded && [[NSFileManager defaultManager] fileExistsAtPath:payloadCachePath]) {
             if (tryDlopen(payloadCachePath)) {
-                logMessage(@"Cached payload loaded (fast path)");
-                logMessage(@"========================================");
-                return;
+                logMessage(@"✓ Payload active from cache");
+                payloadLoaded = YES;
             }
-            // Can't load — ensure it's deployed to Tweaks
-            if (tweaksFolder) {
-                savePayloadToTweaksFolder(payloadCachePath);
-                logMessage(@"Deployed to Tweaks — close and reopen from LC to activate");
-            }
-            // Don't re-download, just show "reopen from LC" message
-            [[NSNotificationCenter defaultCenter]
-                addObserverForName:@"UIApplicationDidFinishLaunchingNotification"
-                            object:nil queue:[NSOperationQueue mainQueue]
-                        usingBlock:^(NSNotification *note) {
-                createOverlayUI();
-                showOverlayError(@"Payload ready!\n\nClose and reopen from\nLiveContainer to activate.");
-                dismissOverlay(5.0);
-            }];
-            logMessage(@"========================================");
-            return;
         }
 
-        // DOWNLOAD PATH: No payload yet — download, save to Tweaks
-        logMessage(@"Will download payload with UI overlay");
-
-        // We defer UI creation + download to after the run loop starts,
-        // because UIKit isn't initialized yet during constructor time.
-        // We observe UIApplicationDidFinishLaunchingNotification to know
-        // when it's safe to create UIWindow.
+        // Step 3: Check for updates via manifest (deferred to after UI is ready)
         [[NSNotificationCenter defaultCenter]
             addObserverForName:@"UIApplicationDidFinishLaunchingNotification"
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *note) {
-            logMessage(@"App launched — showing download overlay");
-            createOverlayUI();
 
-            // Download on a background thread so UI stays responsive
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
-                downloadAndLoadPayload();
-                logMessage(@"DylibLoader download path complete");
+                // Fetch manifest
+                NSDictionary *manifest = fetchManifest();
+                if (!manifest) {
+                    if (payloadLoaded) {
+                        logMessage(@"Manifest unreachable, but payload already active — OK");
+                    } else {
+                        logMessage(@"Manifest unreachable and no payload loaded");
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            createOverlayUI();
+                            showOverlayError(@"Could not reach server.\nNo payload available.");
+                            dismissOverlay(4.0);
+                        });
+                    }
+                    logMessage(@"========================================");
+                    return;
+                }
+
+                NSInteger remoteVersion = [manifest[@"version"] integerValue];
+                NSString *downloadURL = manifest[@"url"];
+                NSInteger localVersion = getLocalVersion();
+                logMessage(@"Remote v%ld, local v%ld", (long)remoteVersion, (long)localVersion);
+
+                if (remoteVersion <= localVersion && payloadLoaded) {
+                    // Up to date and running — brief success flash
+                    logMessage(@"Payload up to date and active");
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        createOverlayUI();
+                        showOverlaySuccess();
+                        dismissOverlay(1.2);
+                    });
+                    logMessage(@"========================================");
+                    return;
+                }
+
+                if (remoteVersion <= localVersion && !payloadLoaded) {
+                    // Version matches but payload not loaded (needs signing)
+                    // Deploy cache to Tweaks if not already there
+                    if ([[NSFileManager defaultManager] fileExistsAtPath:payloadCachePath] && tweaksFolder) {
+                        savePayloadToTweaksFolder(payloadCachePath);
+                    }
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        createOverlayUI();
+                        showOverlayError(@"Payload ready!\n\nClose and reopen from\nLiveContainer to activate.");
+                        dismissOverlay(5.0);
+                    });
+                    logMessage(@"========================================");
+                    return;
+                }
+
+                // New version available — download
+                logMessage(@"Update available: v%ld → v%ld", (long)localVersion, (long)remoteVersion);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    createOverlayUI();
+                    updateOverlayStatus([NSString stringWithFormat:@"Updating to v%ld...", (long)remoteVersion]);
+                });
+
+                if (!downloadURL || downloadURL.length == 0) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        showOverlayError(@"Invalid manifest.");
+                        dismissOverlay(3.0);
+                    });
+                    logMessage(@"========================================");
+                    return;
+                }
+
+                downloadPayloadFromURL(downloadURL);
+
+                // Update stored version if download succeeded
+                if ([[NSFileManager defaultManager] fileExistsAtPath:payloadCachePath]) {
+                    setLocalVersion(remoteVersion);
+                    logMessage(@"Stored version updated to %ld", (long)remoteVersion);
+                }
                 logMessage(@"========================================");
             });
         }];
 
-        logMessage(@"Registered for app launch notification (download deferred)");
+        logMessage(@"Registered for app launch notification");
     }
 }
