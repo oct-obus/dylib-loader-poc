@@ -600,21 +600,21 @@ static BOOL loadPayloadFromPath(NSString *path) {
     // Step 1: Try loading directly (works if JIT enabled or already signed)
     if (tryDlopen(path)) return YES;
 
-    // Step 2: Try ad-hoc signing first (no cert needed)
+    // Step 2: Try full signing with LC's certificate (what LC uses for JITLess)
     logMessage(@"Direct load failed — trying to sign the payload...");
-    updateOverlayStatus(@"Signing payload (ad-hoc)...");
-    if (signPayloadAdhoc(path)) {
-        logMessage(@"Ad-hoc signed, retrying load...");
-        if (tryDlopen(path)) return YES;
-        logMessage(@"Ad-hoc signed payload still rejected");
-    }
-
-    // Step 3: Try full signing with LC's certificate
     updateOverlayStatus(@"Signing with LC cert...");
     if (signPayloadWithCert(path)) {
         logMessage(@"Cert-signed, retrying load...");
         if (tryDlopen(path)) return YES;
         logMessage(@"Cert-signed payload still rejected");
+    }
+
+    // Step 3: Fallback to ad-hoc signing (may work in some contexts)
+    updateOverlayStatus(@"Signing payload (ad-hoc)...");
+    if (signPayloadAdhoc(path)) {
+        logMessage(@"Ad-hoc signed, retrying load...");
+        if (tryDlopen(path)) return YES;
+        logMessage(@"Ad-hoc signed payload still rejected");
     }
 
     // All approaches failed
