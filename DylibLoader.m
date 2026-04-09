@@ -21,7 +21,7 @@
 // Configuration
 // ============================================================================
 
-#define PAYLOAD_URL @"https://example.com/payload.dylib"
+#define PAYLOAD_URL @"https://raw.githubusercontent.com/oct-obus/dylib-loader-poc/master/ExamplePayload.dylib"
 #define PAYLOAD_FILENAME @"cached_payload.dylib"
 #define LOG_FILENAME @"dylib_loader.log"
 
