@@ -156,7 +156,7 @@ static void createOverlayUI(void) {
     overlayWindow = ((id (*)(Class, SEL, CGRect))objc_msgSend)(
         [UIWindowClass alloc], NSSelectorFromString(@"initWithFrame:"), screenBounds
     );
-    ((void (*)(id, SEL, NSInteger))objc_msgSend)(overlayWindow, NSSelectorFromString(@"setWindowLevel:"), 10000000);
+    ((void (*)(id, SEL, CGFloat))objc_msgSend)(overlayWindow, NSSelectorFromString(@"setWindowLevel:"), (CGFloat)10000000.0);
     ((void (*)(id, SEL, id))objc_msgSend)(overlayWindow, NSSelectorFromString(@"setBackgroundColor:"),
         colorFromHex(OVERLAY_BG_COLOR, 0.0));
 
