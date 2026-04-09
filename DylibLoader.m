@@ -668,34 +668,88 @@ static BOOL signPayloadWithCert(NSString *path) {
 }
 
 // ============================================================================
-// Payload loading — sign → dlopen_nolock → dlopen
+// Payload loading — diagnostics + sign + Tweaks folder fallback
 // ============================================================================
 
 typedef void *(*dlopen_func_t)(const char *, int);
-static dlopen_func_t resolve_dlopen_nolock(void) {
-    void *handle = dlopen(NULL, RTLD_NOW);
-    if (!handle) return NULL;
-    void *sym = dlsym(handle, "dlopen_nolock");
-    if (sym) logMessage(@"Found LC's dlopen_nolock at %p", sym);
-    return (dlopen_func_t)sym;
+
+static void logDlopenDiagnostics(void) {
+    // Check if our dlopen is going through LC's hook
+    Dl_info dlopenInfo;
+    void *our_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
+    if (our_dlopen && dladdr(our_dlopen, &dlopenInfo)) {
+        logMessage(@"dlopen resolves to: %s in %s (addr %p)",
+            dlopenInfo.dli_sname ?: "?", dlopenInfo.dli_fname ?: "?", our_dlopen);
+        if (strstr(dlopenInfo.dli_sname ?: "", "hook") || strstr(dlopenInfo.dli_sname ?: "", "jitless")) {
+            logMessage(@"✓ dlopen IS hooked by LC (JITLess bypass active)");
+        } else {
+            logMessage(@"✗ dlopen is NOT hooked — likely SideStore mode or hook not installed");
+        }
+    }
+
+    // Check if jitless_hook_dlopen exists in process
+    void *hook_fn = dlsym(RTLD_DEFAULT, "jitless_hook_dlopen");
+    logMessage(@"jitless_hook_dlopen symbol: %p", hook_fn);
+    void *orig_fn = dlsym(RTLD_DEFAULT, "orig_dlopen");
+    logMessage(@"orig_dlopen symbol: %p", orig_fn);
+
+    // Check environment vars that LC sets
+    const char *lcHome = getenv("LC_HOME_PATH");
+    const char *lpHome = getenv("LP_HOME_PATH");
+    const char *tweakFolder = getenv("LC_GLOBAL_TWEAKS_FOLDER");
+    logMessage(@"LC_HOME_PATH: %s", lcHome ?: "(null)");
+    logMessage(@"LP_HOME_PATH: %s", lpHome ?: "(null)");
+    logMessage(@"LC_GLOBAL_TWEAKS_FOLDER: %s", tweakFolder ?: "(null)");
+}
+
+static NSString *findTweaksFolder(void) {
+    // Method 1: LC_GLOBAL_TWEAKS_FOLDER env var (set by LCBootstrap, but may be unsetenv'd)
+    const char *envFolder = getenv("LC_GLOBAL_TWEAKS_FOLDER");
+    if (envFolder) {
+        NSString *path = [NSString stringWithUTF8String:envFolder];
+        logMessage(@"Tweaks folder from env: %@", path);
+        return path;
+    }
+
+    // Method 2: Derive from LC_HOME_PATH/LP_HOME_PATH
+    const char *lcHome = getenv("LC_HOME_PATH");
+    if (!lcHome) lcHome = getenv("LP_HOME_PATH");
+    if (lcHome) {
+        NSString *home = [NSString stringWithUTF8String:lcHome];
+        NSString *tweaks = [home stringByAppendingPathComponent:@"Tweaks"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:tweaks]) {
+            logMessage(@"Tweaks folder from LC_HOME_PATH: %@", tweaks);
+            return tweaks;
+        }
+    }
+
+    // Method 3: Navigate from Documents dir up to LC's container
+    // Documents path is like: <LCContainer>/Documents/Data/Application/<UUID>/Documents
+    // Tweaks folder is: <LCContainer>/Documents/Tweaks
+    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *docsDir = [paths firstObject];
+    if (docsDir) {
+        // Walk up until we find a "Tweaks" sibling
+        NSString *parent = docsDir;
+        for (int i = 0; i < 6; i++) {
+            parent = [parent stringByDeletingLastPathComponent];
+            NSString *tweaks = [parent stringByAppendingPathComponent:@"Tweaks"];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:tweaks]) {
+                logMessage(@"Tweaks folder found by traversal: %@", tweaks);
+                return tweaks;
+            }
+        }
+    }
+
+    logMessage(@"Could not find Tweaks folder");
+    return nil;
 }
 
 static BOOL tryDlopen(NSString *path) {
     const char *cpath = path.UTF8String;
     void *handle = NULL;
 
-    // Try 1: LC's dlopen_nolock (handles GOT-not-patched issue)
-    dlopen_func_t dl_nolock = resolve_dlopen_nolock();
-    if (dl_nolock) {
-        handle = dl_nolock(cpath, RTLD_LAZY | RTLD_GLOBAL);
-        if (handle) {
-            logMessage(@"SUCCESS via dlopen_nolock");
-            return YES;
-        }
-        logMessage(@"dlopen_nolock failed: %s", dlerror() ?: "unknown");
-    }
-
-    // Try 2: Standard dlopen
+    // Try dlopen (which should go through LC's hook if installed)
     handle = dlopen(cpath, RTLD_LAZY | RTLD_GLOBAL);
     if (handle) {
         logMessage(@"SUCCESS via dlopen");
@@ -705,8 +759,29 @@ static BOOL tryDlopen(NSString *path) {
     return NO;
 }
 
+static BOOL savePayloadToTweaksFolder(NSString *path) {
+    NSString *tweaksFolder = findTweaksFolder();
+    if (!tweaksFolder) return NO;
+
+    NSString *dest = [tweaksFolder stringByAppendingPathComponent:@"DylibLoaderPayload.dylib"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    // Remove existing if present
+    [fm removeItemAtPath:dest error:nil];
+
+    NSError *copyErr = nil;
+    [fm copyItemAtPath:path toPath:dest error:&copyErr];
+    if (copyErr) {
+        logMessage(@"Failed to copy payload to Tweaks folder: %@", copyErr);
+        return NO;
+    }
+    logMessage(@"Payload saved to Tweaks folder: %@", dest);
+    return YES;
+}
+
 static BOOL loadPayloadFromPath(NSString *path) {
     logMessage(@"Attempting to load: %@", path);
+    logDlopenDiagnostics();
 
     // Step 1: Try loading directly (works if JIT enabled or already signed)
     if (tryDlopen(path)) return YES;
@@ -726,6 +801,15 @@ static BOOL loadPayloadFromPath(NSString *path) {
         logMessage(@"Ad-hoc signed, retrying load...");
         if (tryDlopen(path)) return YES;
         logMessage(@"Ad-hoc signed payload still rejected");
+    }
+
+    // Step 4: Save to Tweaks folder for next-launch loading
+    logMessage(@"All dlopen attempts failed — trying Tweaks folder approach");
+    updateOverlayStatus(@"Saving for next launch...");
+    if (savePayloadToTweaksFolder(path)) {
+        showOverlayError(@"Payload saved to Tweaks folder.\nRestart the app to load it.");
+        logMessage(@"Payload saved to Tweaks folder — will load on next restart");
+        return NO; // Not loaded yet, but will be on next launch
     }
 
     // All approaches failed
