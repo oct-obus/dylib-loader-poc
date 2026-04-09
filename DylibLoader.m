@@ -22,15 +22,20 @@
 
 // Panel config
 #define PANEL_WIDTH         300.0
-#define PANEL_MIN_HEIGHT     60.0
+#define PANEL_MIN_HEIGHT    120.0
 #define PANEL_CORNER_RADIUS  14.0
 #define PANEL_MARGIN_TOP     60.0
 #define PANEL_MARGIN_RIGHT   12.0
-#define ROW_HEIGHT           64.0
+#define ROW_MIN_HEIGHT       64.0
 #define HEADER_HEIGHT        44.0
-#define FOOTER_HEIGHT        44.0
+#define FOOTER_HEIGHT        20.0
 #define MINIMIZED_WIDTH      56.0
 #define MINIMIZED_HEIGHT     44.0
+#define RESIZE_HANDLE_SIZE   24.0
+#define PANEL_MIN_WIDTH     200.0
+
+// Persistence keys
+#define PREFS_FRAME_KEY @"DLM_PanelFrame"
 
 // Colors
 #define COLOR_ACCENT    0x00FF88
@@ -120,6 +125,7 @@ static BOOL panelMinimized = NO;
 static CGRect panelExpandedFrame;
 static id gestureHandler = nil;
 static Class gestureHandlerClass = Nil;
+static CGFloat currentPanelWidth = PANEL_WIDTH;
 
 // ============================================================================
 // Logging
@@ -204,6 +210,38 @@ static id colorFromHex(uint32_t hex, CGFloat alpha) {
         NSSelectorFromString(@"colorWithRed:green:blue:alpha:"),
         r, g, b, alpha
     );
+}
+
+static void savePanelFrame(void) {
+    if (!floatingWindow) return;
+    CGRect wf = ((CGRect (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("frame"));
+    NSDictionary *d = @{
+        @"x": @(wf.origin.x), @"y": @(wf.origin.y),
+        @"w": @(wf.size.width), @"h": @(wf.size.height)
+    };
+    [[NSUserDefaults standardUserDefaults] setObject:d forKey:PREFS_FRAME_KEY];
+}
+
+static CGRect loadPanelFrame(CGRect defaultFrame) {
+    NSDictionary *d = [[NSUserDefaults standardUserDefaults] objectForKey:PREFS_FRAME_KEY];
+    if (!d || ![d isKindOfClass:[NSDictionary class]]) return defaultFrame;
+    CGFloat x = [d[@"x"] doubleValue];
+    CGFloat y = [d[@"y"] doubleValue];
+    CGFloat w = [d[@"w"] doubleValue];
+    CGFloat h = [d[@"h"] doubleValue];
+    if (w < PANEL_MIN_WIDTH || h < PANEL_MIN_HEIGHT) return defaultFrame;
+    return CGRectMake(x, y, w, h);
+}
+
+static CGFloat measureWrappedTextHeight(NSString *text, id font, CGFloat maxWidth) {
+    if (!text || text.length == 0) return 0;
+    CGSize constraintSize = {maxWidth, 10000.0};
+    NSDictionary *attrs = @{@"NSFont": font};
+    // boundingRectWithSize:options:attributes:context: with options 1|2 (UsesLineFragmentOrigin|UsesFontLeading)
+    CGRect textRect = ((CGRect (*)(id, SEL, CGSize, NSInteger, id, id))objc_msgSend)(
+        text, sel_registerName("boundingRectWithSize:options:attributes:context:"),
+        constraintSize, (NSInteger)(1 | 2), attrs, nil);
+    return ceil(textRect.size.height);
 }
 
 static id systemFont(CGFloat size) {
@@ -520,6 +558,33 @@ static void processEntry(DLMEntry *entry) {
 
 static void rebuildUI(void);
 
+static void handleResizeGesture(id self, SEL _cmd, id gesture) {
+    if (!floatingWindow || panelMinimized) return;
+    CGPoint trans = ((CGPoint (*)(id, SEL, id))objc_msgSend)(
+        gesture, sel_registerName("translationInView:"),
+        ((id (*)(id, SEL))objc_msgSend)(gesture, sel_registerName("view")));
+    CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("frame"));
+    CGFloat newW = frame.size.width + trans.x;
+    CGFloat newH = frame.size.height + trans.y;
+    if (newW < PANEL_MIN_WIDTH) newW = PANEL_MIN_WIDTH;
+    if (newH < PANEL_MIN_HEIGHT) newH = PANEL_MIN_HEIGHT;
+    frame.size.width = newW;
+    frame.size.height = newH;
+    currentPanelWidth = newW;
+    ((void (*)(id, SEL, CGRect))objc_msgSend)(floatingWindow, sel_registerName("setFrame:"), frame);
+    CGPoint zero = {0, 0};
+    ((void (*)(id, SEL, CGPoint, id))objc_msgSend)(
+        gesture, sel_registerName("setTranslation:inView:"), zero,
+        ((id (*)(id, SEL))objc_msgSend)(gesture, sel_registerName("view")));
+    panelExpandedFrame = frame;
+    // Save and rebuild on end
+    NSInteger state = ((NSInteger (*)(id, SEL))objc_msgSend)(gesture, sel_registerName("state"));
+    if (state == 3) { // UIGestureRecognizerStateEnded
+        savePanelFrame();
+        rebuildUI();
+    }
+}
+
 static void handlePanGesture(id self, SEL _cmd, id gesture) {
     if (!floatingWindow) return;
     CGPoint trans = ((CGPoint (*)(id, SEL, id))objc_msgSend)(
@@ -534,6 +599,9 @@ static void handlePanGesture(id self, SEL _cmd, id gesture) {
         gesture, sel_registerName("setTranslation:inView:"), zero,
         ((id (*)(id, SEL))objc_msgSend)(gesture, sel_registerName("view")));
     if (!panelMinimized) panelExpandedFrame = frame;
+    // Save position on drag end
+    NSInteger state = ((NSInteger (*)(id, SEL))objc_msgSend)(gesture, sel_registerName("state"));
+    if (state == 3) savePanelFrame(); // UIGestureRecognizerStateEnded = 3
 }
 
 static void handleMinimizeTap(id self, SEL _cmd) {
@@ -700,6 +768,21 @@ static void handleToggle(id self, SEL _cmd, id sender) {
     if (!isOn) {
         removeFromTweaks([entry tweaksFilename]);
         entry.status = @"idle";
+    } else {
+        // Re-enable: deploy cached dylib to Tweaks immediately so only 1 restart needed
+        NSString *cachePath = [docsDir stringByAppendingPathComponent:[entry cacheFilename]];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:cachePath]) {
+            if (deployToTweaks(cachePath, [entry tweaksFilename])) {
+                entry.status = @"pending_restart";
+                logMessage(@"[%@] Re-deployed to Tweaks on toggle", entry.name);
+            } else {
+                entry.status = @"error";
+                entry.errorDetail = @"Deploy failed";
+            }
+        } else {
+            entry.status = @"idle";
+            logMessage(@"[%@] No cached dylib to deploy", entry.name);
+        }
     }
     saveConfig();
     dispatch_async(dispatch_get_main_queue(), ^{ rebuildUI(); });
@@ -729,6 +812,7 @@ static void registerHandlerClass(void) {
     if (gestureHandlerClass) return;
     gestureHandlerClass = objc_allocateClassPair([NSObject class], "DLMHandler", 0);
     class_addMethod(gestureHandlerClass, sel_registerName("handlePan:"), (IMP)handlePanGesture, "v@:@");
+    class_addMethod(gestureHandlerClass, sel_registerName("handleResize:"), (IMP)handleResizeGesture, "v@:@");
     class_addMethod(gestureHandlerClass, sel_registerName("handleMinimize"), (IMP)handleMinimizeTap, "v@:");
     class_addMethod(gestureHandlerClass, sel_registerName("handleClose"), (IMP)handleCloseTap, "v@:");
     class_addMethod(gestureHandlerClass, sel_registerName("handleAdd"), (IMP)handleAddTap, "v@:");
@@ -774,11 +858,19 @@ static id makeHeaderButton(NSString *title, CGFloat x, CGFloat w, SEL action, ui
     return b;
 }
 
-static id makeEntryRow(DLMEntry *entry, NSInteger index, CGFloat yOffset) {
+static CGFloat makeEntryRow(DLMEntry *entry, NSInteger index, CGFloat yOffset, id parentView, CGFloat panelW) {
     Class UIViewClass = NSClassFromString(@"UIView");
     Class UISwitchClass = NSClassFromString(@"UISwitch");
 
-    CGRect rowFrame = CGRectMake(0, yOffset, PANEL_WIDTH, ROW_HEIGHT);
+    // Calculate URL text height for dynamic row sizing
+    CGFloat textAreaWidth = panelW - 104; // left padding (58) + right for delete (46)
+    id urlFont = monoFont(9);
+    CGFloat urlHeight = measureWrappedTextHeight(entry.manifestURL, urlFont, textAreaWidth);
+    if (urlHeight < 14) urlHeight = 14;
+
+    CGFloat rowHeight = fmax(ROW_MIN_HEIGHT, 44 + urlHeight + 4);
+
+    CGRect rowFrame = CGRectMake(0, yOffset, panelW, rowHeight);
     id row = ((id (*)(Class, SEL, CGRect))objc_msgSend)([UIViewClass alloc],
         NSSelectorFromString(@"initWithFrame:"), rowFrame);
     ((void (*)(id, SEL, id))objc_msgSend)(row, NSSelectorFromString(@"setBackgroundColor:"),
@@ -787,7 +879,7 @@ static id makeEntryRow(DLMEntry *entry, NSInteger index, CGFloat yOffset) {
     // Toggle switch
     id toggle = ((id (*)(id, SEL))objc_msgSend)([UISwitchClass alloc], NSSelectorFromString(@"init"));
     ((void (*)(id, SEL, CGRect))objc_msgSend)(toggle, NSSelectorFromString(@"setFrame:"),
-        CGRectMake(8, (ROW_HEIGHT - 31) / 2, 51, 31));
+        CGRectMake(8, (rowHeight - 31) / 2, 51, 31));
     ((void (*)(id, SEL, BOOL))objc_msgSend)(toggle, NSSelectorFromString(@"setOn:"), entry.enabled);
     ((void (*)(id, SEL, id))objc_msgSend)(toggle, NSSelectorFromString(@"setOnTintColor:"),
         colorFromHex(COLOR_ACCENT, 1.0));
@@ -795,30 +887,29 @@ static id makeEntryRow(DLMEntry *entry, NSInteger index, CGFloat yOffset) {
     ((void (*)(id, SEL, id, SEL, NSInteger))objc_msgSend)(toggle,
         NSSelectorFromString(@"addTarget:action:forControlEvents:"),
         gestureHandler, sel_registerName("handleToggle:"), (NSInteger)(1 << 12)); // ValueChanged
-    // Scale down the switch
     CGAffineTransform t = CGAffineTransformMakeScale(0.7, 0.7);
     ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(toggle, NSSelectorFromString(@"setTransform:"), t);
 
     // Name + version
     NSString *nameStr = [NSString stringWithFormat:@"%@ v%ld", entry.name, (long)entry.version];
-    id nameLbl = makeLabel(CGRectMake(58, 4, PANEL_WIDTH - 100, 20),
+    id nameLbl = makeLabel(CGRectMake(58, 4, textAreaWidth, 20),
         nameStr, boldFont(13), colorFromHex(0xFFFFFF, 0.95));
 
     // Status
-    id statusLbl = makeLabel(CGRectMake(58, 24, PANEL_WIDTH - 100, 16),
+    id statusLbl = makeLabel(CGRectMake(58, 24, textAreaWidth, 16),
         statusText(entry), systemFont(11), statusColor(entry.status));
 
-    // Source URL (truncated)
-    NSString *urlDisplay = entry.manifestURL;
-    if (urlDisplay.length > 40) urlDisplay = [[urlDisplay substringToIndex:37] stringByAppendingString:@"..."];
-    id urlLbl = makeLabel(CGRectMake(58, 42, PANEL_WIDTH - 100, 14),
-        urlDisplay, monoFont(9), colorFromHex(0xFFFFFF, 0.3));
+    // Source URL (word-wrapped)
+    id urlLbl = makeLabel(CGRectMake(58, 42, textAreaWidth, urlHeight),
+        entry.manifestURL, urlFont, colorFromHex(0xFFFFFF, 0.3));
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(urlLbl, NSSelectorFromString(@"setNumberOfLines:"), (NSInteger)0);
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(urlLbl, NSSelectorFromString(@"setLineBreakMode:"), (NSInteger)0); // NSLineBreakByWordWrapping
 
     // Delete button (44x44 touch target)
     Class btnClass = NSClassFromString(@"UIButton");
     id delBtn = ((id (*)(Class, SEL, NSInteger))objc_msgSend)(btnClass, NSSelectorFromString(@"buttonWithType:"), 0);
     ((void (*)(id, SEL, CGRect))objc_msgSend)(delBtn, NSSelectorFromString(@"setFrame:"),
-        CGRectMake(PANEL_WIDTH - 44, (ROW_HEIGHT - 44) / 2, 44, 44));
+        CGRectMake(panelW - 44, (rowHeight - 44) / 2, 44, 44));
     ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(delBtn, NSSelectorFromString(@"setTitle:forState:"), @"x", 0);
     id delLbl = ((id (*)(id, SEL))objc_msgSend)(delBtn, NSSelectorFromString(@"titleLabel"));
     ((void (*)(id, SEL, id))objc_msgSend)(delLbl, NSSelectorFromString(@"setFont:"), boldFont(14));
@@ -835,7 +926,8 @@ static id makeEntryRow(DLMEntry *entry, NSInteger index, CGFloat yOffset) {
     ((void (*)(id, SEL, id))objc_msgSend)(row, NSSelectorFromString(@"addSubview:"), urlLbl);
     ((void (*)(id, SEL, id))objc_msgSend)(row, NSSelectorFromString(@"addSubview:"), delBtn);
 
-    return row;
+    ((void (*)(id, SEL, id))objc_msgSend)(parentView, NSSelectorFromString(@"addSubview:"), row);
+    return rowHeight;
 }
 
 static void rebuildUI(void) {
@@ -869,7 +961,6 @@ static void rebuildUI(void) {
             @"DL", boldFont(13), colorFromHex(COLOR_ACCENT, 0.9));
         ((void (*)(id, SEL, NSInteger))objc_msgSend)(pillLabel, NSSelectorFromString(@"setTextAlignment:"), 1);
         ((void (*)(id, SEL, id))objc_msgSend)(cv, NSSelectorFromString(@"addSubview:"), pillLabel);
-        // Tap to expand
         Class tapClass = NSClassFromString(@"UITapGestureRecognizer");
         id tap = ((id (*)(id, SEL, id, SEL))objc_msgSend)(
             [tapClass alloc], NSSelectorFromString(@"initWithTarget:action:"),
@@ -885,12 +976,23 @@ static void rebuildUI(void) {
         snapshot = [entries copy];
     }
 
-    // Auto-size: grow to fit content, cap at 70% of screen height
+    CGFloat panelW = currentPanelWidth;
+
+    // Calculate total content height with dynamic row heights
+    CGFloat totalRowHeight = 0;
+    for (DLMEntry *e in snapshot) {
+        CGFloat textW = panelW - 104;
+        CGFloat urlH = measureWrappedTextHeight(e.manifestURL, monoFont(9), textW);
+        if (urlH < 14) urlH = 14;
+        totalRowHeight += fmax(ROW_MIN_HEIGHT, 44 + urlH + 4);
+    }
+    if (snapshot.count == 0) totalRowHeight = 70; // empty state
+
     id mainScreen = ((id (*)(Class, SEL))objc_msgSend)(
         NSClassFromString(@"UIScreen"), NSSelectorFromString(@"mainScreen"));
     CGRect screenBounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, NSSelectorFromString(@"bounds"));
     CGFloat maxHeight = screenBounds.size.height * 0.7;
-    CGFloat contentHeight = HEADER_HEIGHT + snapshot.count * ROW_HEIGHT + FOOTER_HEIGHT;
+    CGFloat contentHeight = HEADER_HEIGHT + totalRowHeight + FOOTER_HEIGHT;
     CGFloat panelHeight = fmin(fmax(contentHeight, PANEL_MIN_HEIGHT), maxHeight);
 
     // Blur background
@@ -901,7 +1003,7 @@ static void rebuildUI(void) {
     id blurView = ((id (*)(Class, SEL, id))objc_msgSend)(
         [UIVisualEffectViewClass alloc], NSSelectorFromString(@"initWithEffect:"), blurEffect);
     ((void (*)(id, SEL, CGRect))objc_msgSend)(blurView, NSSelectorFromString(@"setFrame:"),
-        CGRectMake(0, 0, PANEL_WIDTH, panelHeight));
+        CGRectMake(0, 0, panelW, panelHeight));
     id blurLayer = ((id (*)(id, SEL))objc_msgSend)(blurView, NSSelectorFromString(@"layer"));
     ((void (*)(id, SEL, CGFloat))objc_msgSend)(blurLayer, NSSelectorFromString(@"setCornerRadius:"), PANEL_CORNER_RADIUS);
     ((void (*)(id, SEL, BOOL))objc_msgSend)(blurLayer, NSSelectorFromString(@"setMasksToBounds:"), YES);
@@ -909,56 +1011,81 @@ static void rebuildUI(void) {
     id contentView = ((id (*)(id, SEL))objc_msgSend)(blurView, NSSelectorFromString(@"contentView"));
 
     // Header
-    id titleLbl = makeLabel(CGRectMake(12, 8, PANEL_WIDTH - 100, 24),
+    id titleLbl = makeLabel(CGRectMake(12, 10, panelW - 140, 24),
         @"DylibLoader", boldFont(15), colorFromHex(COLOR_ACCENT, 1.0));
     ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), titleLbl);
 
     // Header buttons (44pt touch targets, full header height)
-    id addBtn = makeHeaderButton(@"+", PANEL_WIDTH - 132, 44, sel_registerName("handleAdd"), COLOR_ACCENT);
-    id minBtn = makeHeaderButton(@"-", PANEL_WIDTH - 88, 44, sel_registerName("handleMinimize"), 0xFFFFFF);
-    id closeBtn = makeHeaderButton(@"x", PANEL_WIDTH - 44, 44, sel_registerName("handleClose"), 0xFF6666);
+    id addBtn = makeHeaderButton(@"+", panelW - 132, 44, sel_registerName("handleAdd"), COLOR_ACCENT);
+    id minBtn = makeHeaderButton(@"-", panelW - 88, 44, sel_registerName("handleMinimize"), 0xFFFFFF);
+    id closeBtn = makeHeaderButton(@"x", panelW - 44, 44, sel_registerName("handleClose"), 0xFF6666);
     ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), addBtn);
     ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), minBtn);
     ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), closeBtn);
 
     // Scrollable content area
     Class UIScrollViewClass = NSClassFromString(@"UIScrollView");
-    CGFloat scrollHeight = panelHeight - HEADER_HEIGHT;
+    CGFloat scrollHeight = panelHeight - HEADER_HEIGHT - RESIZE_HANDLE_SIZE;
     scrollView = ((id (*)(Class, SEL, CGRect))objc_msgSend)(
         [UIScrollViewClass alloc], NSSelectorFromString(@"initWithFrame:"),
-        CGRectMake(0, HEADER_HEIGHT, PANEL_WIDTH, scrollHeight));
+        CGRectMake(0, HEADER_HEIGHT, panelW, scrollHeight));
 
-    // Entry rows
+    // Entry rows (dynamic height)
     CGFloat y = 0;
     for (NSInteger i = 0; i < (NSInteger)snapshot.count; i++) {
-        id row = makeEntryRow(snapshot[i], i, y);
-        ((void (*)(id, SEL, id))objc_msgSend)(scrollView, NSSelectorFromString(@"addSubview:"), row);
-        y += ROW_HEIGHT;
+        CGFloat rowH = makeEntryRow(snapshot[i], i, y, scrollView, panelW);
+        y += rowH;
     }
 
     // Empty state
     if (snapshot.count == 0) {
-        id emptyLbl = makeLabel(CGRectMake(0, 20, PANEL_WIDTH, 20),
-            @"No dylibs configured", systemFont(13), colorFromHex(0xFFFFFF, 0.4));
+        id emptyLbl = makeLabel(CGRectMake(0, 10, panelW, 20),
+            @"No dylibs configured", systemFont(14), colorFromHex(0xFFFFFF, 0.5));
         ((void (*)(id, SEL, NSInteger))objc_msgSend)(emptyLbl, NSSelectorFromString(@"setTextAlignment:"), 1);
         ((void (*)(id, SEL, id))objc_msgSend)(scrollView, NSSelectorFromString(@"addSubview:"), emptyLbl);
 
-        id hintLbl = makeLabel(CGRectMake(0, 42, PANEL_WIDTH, 16),
-            @"Tap + to add a manifest URL", systemFont(11), colorFromHex(0xFFFFFF, 0.25));
+        id hintLbl = makeLabel(CGRectMake(0, 34, panelW, 16),
+            @"Tap + to add a manifest URL", systemFont(12), colorFromHex(0xFFFFFF, 0.3));
         ((void (*)(id, SEL, NSInteger))objc_msgSend)(hintLbl, NSSelectorFromString(@"setTextAlignment:"), 1);
         ((void (*)(id, SEL, id))objc_msgSend)(scrollView, NSSelectorFromString(@"addSubview:"), hintLbl);
-        y = 70;
+        y = 60;
     }
 
-    CGSize contentSize = {PANEL_WIDTH, y + FOOTER_HEIGHT};
-    ((void (*)(id, SEL, CGSize))objc_msgSend)(scrollView, NSSelectorFromString(@"setContentSize:"), contentSize);
-
+    CGSize scrollContentSize = {panelW, y + FOOTER_HEIGHT};
+    ((void (*)(id, SEL, CGSize))objc_msgSend)(scrollView, NSSelectorFromString(@"setContentSize:"), scrollContentSize);
     ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), scrollView);
+
+    // Resize handle (bottom-right corner)
+    Class UIViewClass = NSClassFromString(@"UIView");
+    id resizeHandle = ((id (*)(Class, SEL, CGRect))objc_msgSend)([UIViewClass alloc],
+        NSSelectorFromString(@"initWithFrame:"),
+        CGRectMake(panelW - RESIZE_HANDLE_SIZE, panelHeight - RESIZE_HANDLE_SIZE,
+                   RESIZE_HANDLE_SIZE, RESIZE_HANDLE_SIZE));
+    ((void (*)(id, SEL, id))objc_msgSend)(resizeHandle, NSSelectorFromString(@"setBackgroundColor:"),
+        ((id (*)(Class, SEL))objc_msgSend)(NSClassFromString(@"UIColor"), NSSelectorFromString(@"clearColor")));
+    // Draw grip lines
+    for (int i = 0; i < 3; i++) {
+        CGFloat offset = 6 + i * 5;
+        id line = ((id (*)(Class, SEL, CGRect))objc_msgSend)([UIViewClass alloc],
+            NSSelectorFromString(@"initWithFrame:"),
+            CGRectMake(offset, RESIZE_HANDLE_SIZE - 2, RESIZE_HANDLE_SIZE - offset, 1));
+        ((void (*)(id, SEL, id))objc_msgSend)(line, NSSelectorFromString(@"setBackgroundColor:"),
+            colorFromHex(0xFFFFFF, 0.2));
+        ((void (*)(id, SEL, id))objc_msgSend)(resizeHandle, NSSelectorFromString(@"addSubview:"), line);
+    }
+    Class UIPanClass = NSClassFromString(@"UIPanGestureRecognizer");
+    id resizePan = ((id (*)(id, SEL, id, SEL))objc_msgSend)(
+        [UIPanClass alloc], NSSelectorFromString(@"initWithTarget:action:"),
+        gestureHandler, sel_registerName("handleResize:"));
+    ((void (*)(id, SEL, id))objc_msgSend)(resizeHandle, NSSelectorFromString(@"addGestureRecognizer:"), resizePan);
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(resizeHandle, NSSelectorFromString(@"setUserInteractionEnabled:"), YES);
+    ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), resizeHandle);
+
     ((void (*)(id, SEL, id))objc_msgSend)(rootView, NSSelectorFromString(@"addSubview:"), blurView);
 
     // Update window frame to match content
     CGRect wf = ((CGRect (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("frame"));
-    wf.size.width = PANEL_WIDTH;
+    wf.size.width = panelW;
     wf.size.height = panelHeight;
     ((void (*)(id, SEL, CGRect))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setFrame:"), wf);
     panelExpandedFrame = wf;
@@ -982,7 +1109,9 @@ static void createFloatingPanel(void) {
     CGFloat panelX = screenBounds.size.width - PANEL_WIDTH - PANEL_MARGIN_RIGHT;
     CGFloat panelY = PANEL_MARGIN_TOP;
     CGFloat initialH = PANEL_MIN_HEIGHT;
-    CGRect wf = CGRectMake(panelX, panelY, PANEL_WIDTH, initialH);
+    CGRect defaultFrame = CGRectMake(panelX, panelY, PANEL_WIDTH, initialH);
+    CGRect wf = loadPanelFrame(defaultFrame);
+    currentPanelWidth = wf.size.width;
 
     floatingWindow = ((id (*)(Class, SEL, CGRect))objc_msgSend)(
         [UIWindowClass alloc], NSSelectorFromString(@"initWithFrame:"), wf);
