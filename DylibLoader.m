@@ -498,35 +498,104 @@ static BOOL signPayloadAdhoc(NSString *path) {
 static BOOL signPayloadWithCert(NSString *path) {
     if (!ensureZSignLoaded()) return NO;
 
-    // Get certificate data from LC's shared NSUserDefaults
+    // === Step 1: Get app group ID for reading certificate data ===
     Class LCSharedUtils = NSClassFromString(@"LCSharedUtils");
     NSString *appGroupID = nil;
     SEL groupSel = NSSelectorFromString(@"appGroupID");
     if (LCSharedUtils && [LCSharedUtils respondsToSelector:groupSel]) {
         appGroupID = ((NSString *(*)(Class, SEL))objc_msgSend)(LCSharedUtils, groupSel);
+        logMessage(@"LCSharedUtils.appGroupID = %@", appGroupID);
+    } else {
+        logMessage(@"LCSharedUtils not available, trying SecTask entitlements...");
+        // Fallback: read app groups from process entitlements via Security framework
+        void *secFW = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
+        if (secFW) {
+            typedef void* (*SecTaskCreateFromSelf_t)(void *allocator);
+            typedef void* (*SecTaskCopyValueForEntitlement_t)(void *task, void *entitlement, void *error);
+            SecTaskCreateFromSelf_t _SecTaskCreateFromSelf = dlsym(secFW, "SecTaskCreateFromSelf");
+            SecTaskCopyValueForEntitlement_t _SecTaskCopyValueForEntitlement = dlsym(secFW, "SecTaskCopyValueForEntitlement");
+            if (_SecTaskCreateFromSelf && _SecTaskCopyValueForEntitlement) {
+                void *task = _SecTaskCreateFromSelf(NULL);
+                if (task) {
+                    CFArrayRef groups = _SecTaskCopyValueForEntitlement(task,
+                        (__bridge void *)@"com.apple.security.application-groups", NULL);
+                    if (groups && CFArrayGetCount(groups) > 0) {
+                        appGroupID = (__bridge NSString *)CFArrayGetValueAtIndex(groups, 0);
+                        logMessage(@"App group from entitlements: %@", appGroupID);
+                    }
+                    if (groups) CFRelease(groups);
+                    CFRelease(task);
+                }
+            }
+        }
     }
 
-    NSUserDefaults *shared = appGroupID
-        ? [[NSUserDefaults alloc] initWithSuiteName:appGroupID]
-        : [NSUserDefaults standardUserDefaults];
-
-    NSData *certData = [shared objectForKey:@"LCCertificateData"];
-    NSString *certPass = [shared objectForKey:@"LCCertificatePassword"];
-    if (!certData || !certPass) {
-        logMessage(@"No certificate data available (certData=%p, certPass=%p)", certData, certPass);
-        // Also try standard defaults as fallback
-        certData = certData ?: [[NSUserDefaults standardUserDefaults] objectForKey:@"LCCertificateData"];
-        certPass = certPass ?: [[NSUserDefaults standardUserDefaults] objectForKey:@"LCCertificatePassword"];
-        if (!certData || !certPass) return NO;
-    }
-
-    NSData *provData = [NSData dataWithContentsOfURL:
-        [[NSBundle mainBundle] URLForResource:@"embedded" withExtension:@"mobileprovision"]];
-    if (!provData) {
-        logMessage(@"No provisioning profile found");
+    if (!appGroupID || [appGroupID isEqualToString:@"Unknown"]) {
+        logMessage(@"Could not determine app group ID (got: %@)", appGroupID);
         return NO;
     }
 
+    // === Step 2: Read certificate data from shared NSUserDefaults ===
+    NSUserDefaults *shared = [[NSUserDefaults alloc] initWithSuiteName:appGroupID];
+    NSData *certData = [shared objectForKey:@"LCCertificateData"];
+    NSString *certPass = [shared objectForKey:@"LCCertificatePassword"];
+    logMessage(@"Certificate: data=%lu bytes, password=%@",
+        (unsigned long)(certData ? certData.length : 0),
+        certPass ? @"present" : @"nil");
+
+    if (!certData) {
+        logMessage(@"No LCCertificateData in suite '%@'", appGroupID);
+        // Also try LCSharedUtils.certificatePassword as fallback for password
+        if (LCSharedUtils) {
+            SEL certPassSel = NSSelectorFromString(@"certificatePassword");
+            if ([LCSharedUtils respondsToSelector:certPassSel]) {
+                certPass = ((NSString *(*)(Class, SEL))objc_msgSend)(LCSharedUtils, certPassSel);
+                logMessage(@"Got password from LCSharedUtils: %@", certPass ? @"yes" : @"no");
+            }
+        }
+        // Try reading certData from LCUtils.certificateData
+        Class LCUtils = NSClassFromString(@"LCUtils");
+        SEL certDataSel = NSSelectorFromString(@"certificateData");
+        if (LCUtils && [LCUtils respondsToSelector:certDataSel]) {
+            certData = ((NSData *(*)(Class, SEL))objc_msgSend)(LCUtils, certDataSel);
+            logMessage(@"Got certData from LCUtils: %lu bytes", (unsigned long)(certData ? certData.length : 0));
+        }
+        if (!certData) return NO;
+    }
+
+    if (!certPass) {
+        // Try LCSharedUtils.certificatePassword
+        if (LCSharedUtils) {
+            SEL certPassSel = NSSelectorFromString(@"certificatePassword");
+            if ([LCSharedUtils respondsToSelector:certPassSel]) {
+                certPass = ((NSString *(*)(Class, SEL))objc_msgSend)(LCSharedUtils, certPassSel);
+            }
+        }
+        if (!certPass) {
+            logMessage(@"No certificate password found");
+            return NO;
+        }
+    }
+
+    // === Step 3: Get provisioning profile from REAL LC bundle (not guest app) ===
+    NSString *realBundlePath = getRealFrameworksPath();  // returns .../App.app/Frameworks
+    NSString *realAppPath = [realBundlePath stringByDeletingLastPathComponent]; // .../App.app
+    NSString *provPath = [realAppPath stringByAppendingPathComponent:@"embedded.mobileprovision"];
+    logMessage(@"Looking for provisioning profile at: %@", provPath);
+    NSData *provData = [NSData dataWithContentsOfFile:provPath];
+    if (!provData) {
+        // Try alternate: mainBundle (in case LC hasn't patched it yet)
+        NSURL *provURL = [[NSBundle mainBundle] URLForResource:@"embedded" withExtension:@"mobileprovision"];
+        logMessage(@"Fallback mainBundle prov: %@", provURL);
+        if (provURL) provData = [NSData dataWithContentsOfURL:provURL];
+    }
+    if (!provData) {
+        logMessage(@"No provisioning profile found at any location");
+        return NO;
+    }
+    logMessage(@"Provisioning profile: %lu bytes", (unsigned long)provData.length);
+
+    // === Step 4: Sign with ZSigner ===
     logMessage(@"Signing with cert (%lu bytes), pass=***, prov=%lu bytes",
         (unsigned long)certData.length, (unsigned long)provData.length);
 
