@@ -23,13 +23,14 @@
 // Panel config
 #define PANEL_WIDTH         300.0
 #define PANEL_MIN_HEIGHT     60.0
-#define PANEL_MAX_HEIGHT    400.0
 #define PANEL_CORNER_RADIUS  14.0
 #define PANEL_MARGIN_TOP     60.0
 #define PANEL_MARGIN_RIGHT   12.0
 #define ROW_HEIGHT           64.0
-#define HEADER_HEIGHT        40.0
+#define HEADER_HEIGHT        44.0
 #define FOOTER_HEIGHT        44.0
+#define MINIMIZED_WIDTH      56.0
+#define MINIMIZED_HEIGHT     44.0
 
 // Colors
 #define COLOR_ACCENT    0x00FF88
@@ -540,15 +541,27 @@ static void handleMinimizeTap(id self, SEL _cmd) {
     panelMinimized = !panelMinimized;
     CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("frame"));
     if (panelMinimized) {
-        frame.size.height = HEADER_HEIGHT;
+        // Save expanded frame, then collapse to small pill
+        panelExpandedFrame = frame;
+        CGRect pill = CGRectMake(frame.origin.x + frame.size.width - MINIMIZED_WIDTH,
+                                  frame.origin.y, MINIMIZED_WIDTH, MINIMIZED_HEIGHT);
+        ((void (*)(Class, SEL, double, void(^)(void), void(^)(BOOL)))objc_msgSend)(
+            NSClassFromString(@"UIView"),
+            NSSelectorFromString(@"animateWithDuration:animations:completion:"),
+            0.25,
+            ^{ ((void (*)(id, SEL, CGRect))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setFrame:"), pill); },
+            ^(BOOL finished) { rebuildUI(); }
+        );
     } else {
-        frame.size.height = panelExpandedFrame.size.height;
+        // Expand back
+        ((void (*)(Class, SEL, double, void(^)(void), void(^)(BOOL)))objc_msgSend)(
+            NSClassFromString(@"UIView"),
+            NSSelectorFromString(@"animateWithDuration:animations:completion:"),
+            0.25,
+            ^{ ((void (*)(id, SEL, CGRect))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setFrame:"), panelExpandedFrame); },
+            ^(BOOL finished) { rebuildUI(); }
+        );
     }
-    ((void (*)(Class, SEL, double, void(^)(void)))objc_msgSend)(
-        NSClassFromString(@"UIView"), NSSelectorFromString(@"animateWithDuration:animations:"),
-        0.25,
-        ^{ ((void (*)(id, SEL, CGRect))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setFrame:"), frame); }
-    );
 }
 
 static void handleCloseTap(id self, SEL _cmd) {
@@ -617,14 +630,58 @@ static void handleAddTap(id self, SEL _cmd) {
     ((void (*)(id, SEL, id))objc_msgSend)(alert, sel_registerName("addAction:"), addAction);
     ((void (*)(id, SEL, id))objc_msgSend)(alert, sel_registerName("addAction:"), cancelAction);
 
-    // Present on the floating window's root VC
-    if (floatingWindow) {
-        id rootVC = ((id (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("rootViewController"));
-        if (rootVC) {
-            ((void (*)(id, SEL, id, BOOL, id))objc_msgSend)(
-                rootVC, sel_registerName("presentViewController:animated:completion:"),
-                alert, YES, nil);
+    // Present on the app's main window (not our floating panel)
+    id app = ((id (*)(Class, SEL))objc_msgSend)(
+        NSClassFromString(@"UIApplication"), NSSelectorFromString(@"sharedApplication"));
+    id presenterVC = nil;
+
+    // Try UIWindowScene-based enumeration (iOS 13+)
+    if ([app respondsToSelector:NSSelectorFromString(@"connectedScenes")]) {
+        NSSet *scenes = ((id (*)(id, SEL))objc_msgSend)(app, NSSelectorFromString(@"connectedScenes"));
+        for (id scene in scenes) {
+            if (![scene isKindOfClass:NSClassFromString(@"UIWindowScene")]) continue;
+            NSArray *sceneWindows = ((id (*)(id, SEL))objc_msgSend)(scene, NSSelectorFromString(@"windows"));
+            for (id w in sceneWindows) {
+                if (w == floatingWindow) continue;
+                CGFloat wLevel = ((CGFloat (*)(id, SEL))objc_msgSend)(w, NSSelectorFromString(@"windowLevel"));
+                if (wLevel > 1000.0) continue;
+                BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(w, NSSelectorFromString(@"isHidden"));
+                if (hidden) continue;
+                id vc = ((id (*)(id, SEL))objc_msgSend)(w, NSSelectorFromString(@"rootViewController"));
+                if (vc) { presenterVC = vc; break; }
+            }
+            if (presenterVC) break;
         }
+    }
+
+    // Fallback: UIApplication.windows
+    if (!presenterVC) {
+        NSArray *windows = ((id (*)(id, SEL))objc_msgSend)(app, NSSelectorFromString(@"windows"));
+        for (id w in windows) {
+            if (w == floatingWindow) continue;
+            CGFloat wLevel = ((CGFloat (*)(id, SEL))objc_msgSend)(w, NSSelectorFromString(@"windowLevel"));
+            if (wLevel > 1000.0) continue;
+            BOOL hidden = ((BOOL (*)(id, SEL))objc_msgSend)(w, NSSelectorFromString(@"isHidden"));
+            if (hidden) continue;
+            id vc = ((id (*)(id, SEL))objc_msgSend)(w, NSSelectorFromString(@"rootViewController"));
+            if (vc) { presenterVC = vc; break; }
+        }
+    }
+
+    // Last resort: floating panel's VC
+    if (!presenterVC && floatingWindow) {
+        presenterVC = ((id (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("rootViewController"));
+    }
+    if (presenterVC) {
+        // Walk to topmost presented VC
+        id top = presenterVC;
+        id presented = nil;
+        while ((presented = ((id (*)(id, SEL))objc_msgSend)(top, NSSelectorFromString(@"presentedViewController")))) {
+            top = presented;
+        }
+        ((void (*)(id, SEL, id, BOOL, id))objc_msgSend)(
+            top, sel_registerName("presentViewController:animated:completion:"),
+            alert, YES, nil);
     }
 }
 
@@ -706,10 +763,10 @@ static id makeHeaderButton(NSString *title, CGFloat x, CGFloat w, SEL action, ui
     Class btn = NSClassFromString(@"UIButton");
     id b = ((id (*)(Class, SEL, NSInteger))objc_msgSend)(btn, NSSelectorFromString(@"buttonWithType:"), 0);
     ((void (*)(id, SEL, CGRect))objc_msgSend)(b, NSSelectorFromString(@"setFrame:"),
-        CGRectMake(x, 6, w, 28));
+        CGRectMake(x, 0, w, HEADER_HEIGHT));
     ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(b, NSSelectorFromString(@"setTitle:forState:"), title, 0);
     id lbl = ((id (*)(id, SEL))objc_msgSend)(b, NSSelectorFromString(@"titleLabel"));
-    ((void (*)(id, SEL, id))objc_msgSend)(lbl, NSSelectorFromString(@"setFont:"), boldFont(14));
+    ((void (*)(id, SEL, id))objc_msgSend)(lbl, NSSelectorFromString(@"setFont:"), boldFont(16));
     ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(b, NSSelectorFromString(@"setTitleColor:forState:"),
         colorFromHex(color, 0.9), 0);
     ((void (*)(id, SEL, id, SEL, NSInteger))objc_msgSend)(b, NSSelectorFromString(@"addTarget:action:forControlEvents:"),
@@ -757,11 +814,11 @@ static id makeEntryRow(DLMEntry *entry, NSInteger index, CGFloat yOffset) {
     id urlLbl = makeLabel(CGRectMake(58, 42, PANEL_WIDTH - 100, 14),
         urlDisplay, monoFont(9), colorFromHex(0xFFFFFF, 0.3));
 
-    // Delete button
+    // Delete button (44x44 touch target)
     Class btnClass = NSClassFromString(@"UIButton");
     id delBtn = ((id (*)(Class, SEL, NSInteger))objc_msgSend)(btnClass, NSSelectorFromString(@"buttonWithType:"), 0);
     ((void (*)(id, SEL, CGRect))objc_msgSend)(delBtn, NSSelectorFromString(@"setFrame:"),
-        CGRectMake(PANEL_WIDTH - 36, (ROW_HEIGHT - 24) / 2, 28, 24));
+        CGRectMake(PANEL_WIDTH - 44, (ROW_HEIGHT - 44) / 2, 44, 44));
     ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(delBtn, NSSelectorFromString(@"setTitle:forState:"), @"x", 0);
     id delLbl = ((id (*)(id, SEL))objc_msgSend)(delBtn, NSSelectorFromString(@"titleLabel"));
     ((void (*)(id, SEL, id))objc_msgSend)(delLbl, NSSelectorFromString(@"setFont:"), boldFont(14));
@@ -793,12 +850,48 @@ static void rebuildUI(void) {
         ((void (*)(id, SEL))objc_msgSend)(sv, NSSelectorFromString(@"removeFromSuperview"));
     }
 
-    CGFloat entryCount;
-    @synchronized(entries) {
-        entryCount = entries.count;
+    // Minimized: show a small pill with "DL" label, tap to expand
+    if (panelMinimized) {
+        CGRect wf = ((CGRect (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("frame"));
+        Class UIBlurEffectClass = NSClassFromString(@"UIBlurEffect");
+        Class UIVisualEffectViewClass = NSClassFromString(@"UIVisualEffectView");
+        id blurEffect = ((id (*)(Class, SEL, NSInteger))objc_msgSend)(
+            UIBlurEffectClass, NSSelectorFromString(@"effectWithStyle:"), 2);
+        id blurView = ((id (*)(Class, SEL, id))objc_msgSend)(
+            [UIVisualEffectViewClass alloc], NSSelectorFromString(@"initWithEffect:"), blurEffect);
+        ((void (*)(id, SEL, CGRect))objc_msgSend)(blurView, NSSelectorFromString(@"setFrame:"),
+            CGRectMake(0, 0, wf.size.width, wf.size.height));
+        id blurLayer = ((id (*)(id, SEL))objc_msgSend)(blurView, NSSelectorFromString(@"layer"));
+        ((void (*)(id, SEL, CGFloat))objc_msgSend)(blurLayer, NSSelectorFromString(@"setCornerRadius:"), wf.size.height / 2.0);
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(blurLayer, NSSelectorFromString(@"setMasksToBounds:"), YES);
+        id cv = ((id (*)(id, SEL))objc_msgSend)(blurView, NSSelectorFromString(@"contentView"));
+        id pillLabel = makeLabel(CGRectMake(0, 0, wf.size.width, wf.size.height),
+            @"DL", boldFont(13), colorFromHex(COLOR_ACCENT, 0.9));
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(pillLabel, NSSelectorFromString(@"setTextAlignment:"), 1);
+        ((void (*)(id, SEL, id))objc_msgSend)(cv, NSSelectorFromString(@"addSubview:"), pillLabel);
+        // Tap to expand
+        Class tapClass = NSClassFromString(@"UITapGestureRecognizer");
+        id tap = ((id (*)(id, SEL, id, SEL))objc_msgSend)(
+            [tapClass alloc], NSSelectorFromString(@"initWithTarget:action:"),
+            gestureHandler, sel_registerName("handleMinimize"));
+        ((void (*)(id, SEL, id))objc_msgSend)(blurView, NSSelectorFromString(@"addGestureRecognizer:"), tap);
+        ((void (*)(id, SEL, BOOL))objc_msgSend)(blurView, NSSelectorFromString(@"setUserInteractionEnabled:"), YES);
+        ((void (*)(id, SEL, id))objc_msgSend)(rootView, NSSelectorFromString(@"addSubview:"), blurView);
+        return;
     }
-    CGFloat contentHeight = HEADER_HEIGHT + entryCount * ROW_HEIGHT + FOOTER_HEIGHT;
-    CGFloat panelHeight = fmin(fmax(contentHeight, PANEL_MIN_HEIGHT), PANEL_MAX_HEIGHT);
+
+    NSArray *snapshot = nil;
+    @synchronized(entries) {
+        snapshot = [entries copy];
+    }
+
+    // Auto-size: grow to fit content, cap at 70% of screen height
+    id mainScreen = ((id (*)(Class, SEL))objc_msgSend)(
+        NSClassFromString(@"UIScreen"), NSSelectorFromString(@"mainScreen"));
+    CGRect screenBounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, NSSelectorFromString(@"bounds"));
+    CGFloat maxHeight = screenBounds.size.height * 0.7;
+    CGFloat contentHeight = HEADER_HEIGHT + snapshot.count * ROW_HEIGHT + FOOTER_HEIGHT;
+    CGFloat panelHeight = fmin(fmax(contentHeight, PANEL_MIN_HEIGHT), maxHeight);
 
     // Blur background
     Class UIBlurEffectClass = NSClassFromString(@"UIBlurEffect");
@@ -820,10 +913,10 @@ static void rebuildUI(void) {
         @"DylibLoader", boldFont(15), colorFromHex(COLOR_ACCENT, 1.0));
     ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), titleLbl);
 
-    // Header buttons
-    id addBtn = makeHeaderButton(@"+", PANEL_WIDTH - 94, 28, sel_registerName("handleAdd"), COLOR_ACCENT);
-    id minBtn = makeHeaderButton(@"-", PANEL_WIDTH - 62, 28, sel_registerName("handleMinimize"), 0xFFFFFF);
-    id closeBtn = makeHeaderButton(@"x", PANEL_WIDTH - 32, 28, sel_registerName("handleClose"), 0xFF6666);
+    // Header buttons (44pt touch targets, full header height)
+    id addBtn = makeHeaderButton(@"+", PANEL_WIDTH - 132, 44, sel_registerName("handleAdd"), COLOR_ACCENT);
+    id minBtn = makeHeaderButton(@"-", PANEL_WIDTH - 88, 44, sel_registerName("handleMinimize"), 0xFFFFFF);
+    id closeBtn = makeHeaderButton(@"x", PANEL_WIDTH - 44, 44, sel_registerName("handleClose"), 0xFF6666);
     ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), addBtn);
     ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), minBtn);
     ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), closeBtn);
@@ -836,10 +929,6 @@ static void rebuildUI(void) {
         CGRectMake(0, HEADER_HEIGHT, PANEL_WIDTH, scrollHeight));
 
     // Entry rows
-    NSArray *snapshot = nil;
-    @synchronized(entries) {
-        snapshot = [entries copy];
-    }
     CGFloat y = 0;
     for (NSInteger i = 0; i < (NSInteger)snapshot.count; i++) {
         id row = makeEntryRow(snapshot[i], i, y);
@@ -861,17 +950,18 @@ static void rebuildUI(void) {
         y = 70;
     }
 
-    CGSize contentSize = {PANEL_WIDTH, y};
+    CGSize contentSize = {PANEL_WIDTH, y + FOOTER_HEIGHT};
     ((void (*)(id, SEL, CGSize))objc_msgSend)(scrollView, NSSelectorFromString(@"setContentSize:"), contentSize);
 
     ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), scrollView);
     ((void (*)(id, SEL, id))objc_msgSend)(rootView, NSSelectorFromString(@"addSubview:"), blurView);
 
-    // Update window frame
+    // Update window frame to match content
     CGRect wf = ((CGRect (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("frame"));
-    wf.size.height = panelMinimized ? HEADER_HEIGHT : panelHeight;
+    wf.size.width = PANEL_WIDTH;
+    wf.size.height = panelHeight;
     ((void (*)(id, SEL, CGRect))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setFrame:"), wf);
-    if (!panelMinimized) panelExpandedFrame = wf;
+    panelExpandedFrame = wf;
 }
 
 static void createFloatingPanel(void) {
