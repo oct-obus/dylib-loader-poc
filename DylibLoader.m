@@ -160,6 +160,12 @@ static void createOverlayUI(void) {
     ((void (*)(id, SEL, NSInteger))objc_msgSend)(overlayWindow, NSSelectorFromString(@"setWindowLevel:"), 10000000);
     ((void (*)(id, SEL, id))objc_msgSend)(overlayWindow, NSSelectorFromString(@"setBackgroundColor:"),
         colorFromHex(OVERLAY_BG_COLOR, 0.0));
+
+    // iOS requires every visible window to have a rootViewController
+    Class UIViewControllerClass = NSClassFromString(@"UIViewController");
+    id rootVC = ((id (*)(id, SEL))objc_msgSend)([UIViewControllerClass alloc], NSSelectorFromString(@"init"));
+    ((void (*)(id, SEL, id))objc_msgSend)(overlayWindow, NSSelectorFromString(@"setRootViewController:"), rootVC);
+
     ((void (*)(id, SEL, BOOL))objc_msgSend)(overlayWindow, NSSelectorFromString(@"setHidden:"), NO);
 
     // Full-screen dim background
