@@ -147,11 +147,10 @@ static void createOverlayUI(void) {
         return;
     }
 
-    // Get screen bounds
+    // Get screen bounds — [UIScreen bounds] returns CGRect directly (HFA on arm64)
     id mainScreen = ((id (*)(Class, SEL))objc_msgSend)(UIScreenClass, NSSelectorFromString(@"mainScreen"));
-    CGRect screenBounds;
-    NSValue *boundsValue = ((NSValue *(*)(id, SEL))objc_msgSend)(mainScreen, NSSelectorFromString(@"bounds"));
-    [boundsValue getValue:&screenBounds];
+    CGRect screenBounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, NSSelectorFromString(@"bounds"));
+    logMessage(@"Screen bounds: %.0f x %.0f", screenBounds.size.width, screenBounds.size.height);
 
     // Create overlay window that covers the entire screen
     overlayWindow = ((id (*)(Class, SEL, CGRect))objc_msgSend)(
