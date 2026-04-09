@@ -531,10 +531,10 @@ static BOOL loadPayloadFromPath(NSString *path) {
     // In SideStore mode, dlopen is NOT hooked — library validation rejects unsigned dylibs.
     // Save to Tweaks folder so TweakLoader picks it up on next app restart
     // (TweakLoader runs during bootstrap when dylibs get handled by LC's signing pipeline)
-    updateOverlayStatus(@"Saving for next launch...");
+    updateOverlayStatus(@"Saving to Tweaks folder...");
     if (savePayloadToTweaksFolder(path)) {
-        showOverlayError(@"✅ Payload downloaded!\n\nSaved to Tweaks folder.\nRestart the app to activate.");
-        logMessage(@"Payload saved to Tweaks folder — restart app to load");
+        showOverlayError(@"✅ Payload downloaded!\n\nClose and reopen from\nLiveContainer to activate.");
+        logMessage(@"Payload saved to Tweaks folder — close and reopen from LC to activate");
         return NO; // Signals "saved but not loaded yet"
     }
 
@@ -626,36 +626,56 @@ static void DylibLoaderInit(void) {
         logMessage(@"Documents: %@", docsDir);
         logMessage(@"Cache path: %@", payloadCachePath);
 
-        // Check if payload already exists in Tweaks folder (already deployed, waiting for restart)
+        // Check if payload already in Tweaks folder and signed (from previous LC launch)
         NSString *tweaksFolder = findTweaksFolder();
         NSString *tweaksPayload = tweaksFolder ?
             [tweaksFolder stringByAppendingPathComponent:@"DylibLoaderPayload.dylib"] : nil;
         if (tweaksPayload && [[NSFileManager defaultManager] fileExistsAtPath:tweaksPayload]) {
-            logMessage(@"Payload already in Tweaks folder, trying to load: %@", tweaksPayload);
+            logMessage(@"Payload in Tweaks folder, trying to load: %@", tweaksPayload);
             if (tryDlopen(tweaksPayload)) {
-                logMessage(@"Tweaks folder payload loaded successfully!");
+                logMessage(@"✓ Payload active (loaded from Tweaks folder)");
                 logMessage(@"========================================");
+                // Brief success indicator on main thread
+                [[NSNotificationCenter defaultCenter]
+                    addObserverForName:@"UIApplicationDidFinishLaunchingNotification"
+                                object:nil queue:[NSOperationQueue mainQueue]
+                            usingBlock:^(NSNotification *note) {
+                    createOverlayUI();
+                    showOverlaySuccess();
+                    dismissOverlay(1.2);
+                }];
                 return;
             }
-            logMessage(@"Tweaks folder payload exists but couldn't load (may need SideStore refresh)");
+            logMessage(@"Payload in Tweaks but not yet signed — will be signed on next LC launch");
         }
 
-        // FAST PATH: Cached payload → try loading, then try Tweaks folder deploy
+        // Try cached payload (from previous download)
         if ([[NSFileManager defaultManager] fileExistsAtPath:payloadCachePath]) {
             logMessage(@"Found cached payload");
             if (tryDlopen(payloadCachePath)) {
-                logMessage(@"Cached payload loaded successfully (fast path)");
+                logMessage(@"Cached payload loaded (fast path)");
                 logMessage(@"========================================");
                 return;
             }
-            // Already cached but can't load — deploy to Tweaks folder silently
-            if (tweaksFolder && savePayloadToTweaksFolder(payloadCachePath)) {
-                logMessage(@"Cached payload deployed to Tweaks folder, restart to activate");
+            // Can't load — ensure it's deployed to Tweaks
+            if (tweaksFolder) {
+                savePayloadToTweaksFolder(payloadCachePath);
+                logMessage(@"Deployed to Tweaks — close and reopen from LC to activate");
             }
-            logMessage(@"Cached payload not loadable, will show download UI on launch");
+            // Don't re-download, just show "reopen from LC" message
+            [[NSNotificationCenter defaultCenter]
+                addObserverForName:@"UIApplicationDidFinishLaunchingNotification"
+                            object:nil queue:[NSOperationQueue mainQueue]
+                        usingBlock:^(NSNotification *note) {
+                createOverlayUI();
+                showOverlayError(@"Payload ready!\n\nClose and reopen from\nLiveContainer to activate.");
+                dismissOverlay(5.0);
+            }];
+            logMessage(@"========================================");
+            return;
         }
 
-        // DOWNLOAD PATH: Show overlay UI, download, save to Tweaks folder
+        // DOWNLOAD PATH: No payload yet — download, save to Tweaks
         logMessage(@"Will download payload with UI overlay");
 
         // We defer UI creation + download to after the run loop starts,
