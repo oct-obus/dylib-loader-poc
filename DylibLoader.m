@@ -410,45 +410,57 @@ didCompleteWithError:(NSError *)error {
 // LC loads ZSign.dylib with RTLD_GLOBAL, making ZSigner class available.
 // We can ad-hoc sign a single Mach-O, or fully sign with LC's P12 cert.
 
+// dyld functions for finding real executable path
+extern const char* _dyld_get_image_name(uint32_t image_index);
+extern uint32_t _dyld_image_count(void);
+
+// Get real LC bundle Frameworks path (not the guest app path from NSBundle.mainBundle)
+static NSString *getRealFrameworksPath(void) {
+    const char *realExePath = _dyld_get_image_name(0);
+    if (!realExePath) return nil;
+    NSString *realBundle = [[NSString stringWithUTF8String:realExePath] stringByDeletingLastPathComponent];
+    return [realBundle stringByAppendingPathComponent:@"Frameworks"];
+}
+
 static BOOL ensureZSignLoaded(void) {
     if (NSClassFromString(@"ZSigner")) return YES;
 
-    // Method 1: Use @executable_path token — dyld resolves this to the REAL
-    // LC binary location (not the guest app path that NSBundle.mainBundle returns)
-    logMessage(@"Loading ZSign via @executable_path...");
-    void *handle = dlopen("@executable_path/Frameworks/ZSign.dylib", RTLD_GLOBAL);
+    NSString *fwDir = getRealFrameworksPath();
+    if (!fwDir) {
+        logMessage(@"Cannot resolve real LC bundle path");
+        return NO;
+    }
+    logMessage(@"Real LC Frameworks: %@", fwDir);
+
+    // ZSign.dylib depends on OpenSSL.framework — load it first so @rpath resolves
+    NSString *opensslPath = [fwDir stringByAppendingPathComponent:@"OpenSSL.framework/OpenSSL"];
+    logMessage(@"Loading OpenSSL from: %@", opensslPath);
+    void *sslHandle = dlopen(opensslPath.UTF8String, RTLD_GLOBAL);
+    if (!sslHandle) {
+        const char *sslErr = dlerror();
+        logMessage(@"OpenSSL load failed: %s", sslErr ?: "unknown");
+        // Continue anyway — maybe OpenSSL is already loaded
+    } else {
+        logMessage(@"OpenSSL loaded successfully");
+    }
+
+    // Now load ZSign.dylib
+    NSString *zsignPath = [fwDir stringByAppendingPathComponent:@"ZSign.dylib"];
+    logMessage(@"Loading ZSign from: %@", zsignPath);
+    void *handle = dlopen(zsignPath.UTF8String, RTLD_GLOBAL);
     if (handle && NSClassFromString(@"ZSigner")) {
-        logMessage(@"ZSign loaded via @executable_path");
+        logMessage(@"ZSign loaded successfully");
         return YES;
     }
-    const char *err1 = dlerror();
-    logMessage(@"@executable_path failed: %s", err1 ?: "unknown");
+    const char *err = dlerror();
+    logMessage(@"ZSign load failed: %s", err ?: "unknown");
 
-    // Method 2: Resolve real executable path via _dyld_get_image_name(0)
-    extern const char* _dyld_get_image_name(uint32_t image_index);
-    const char *realExePath = _dyld_get_image_name(0);
-    if (realExePath) {
-        NSString *realBundle = [[NSString stringWithUTF8String:realExePath] stringByDeletingLastPathComponent];
-        NSString *fwPath = [realBundle stringByAppendingPathComponent:@"Frameworks/ZSign.dylib"];
-        logMessage(@"Loading ZSign from real path: %@", fwPath);
-        handle = dlopen(fwPath.UTF8String, RTLD_GLOBAL);
-        if (handle && NSClassFromString(@"ZSigner")) {
-            logMessage(@"ZSign loaded from real path");
-            return YES;
-        }
-        const char *err2 = dlerror();
-        logMessage(@"Real path failed: %s", err2 ?: "unknown");
-    }
-
-    // Method 3: Fallback — scan loaded images for ZSign.dylib
-    extern uint32_t _dyld_image_count(void);
+    // Scan loaded images for diagnostics
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "ZSign.dylib")) {
-            logMessage(@"ZSign already loaded as image %u: %s", i, name);
-            // It's loaded but ZSigner class not found — weird but log it
-            break;
+        if (name && (strstr(name, "ZSign") || strstr(name, "OpenSSL"))) {
+            logMessage(@"Found loaded image %u: %s", i, name);
         }
     }
 
