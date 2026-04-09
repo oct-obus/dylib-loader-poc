@@ -404,21 +404,65 @@ didCompleteWithError:(NSError *)error {
 @end
 
 // ============================================================================
-// Payload loading
+// Payload loading — tries LC's dlopen_nolock first, falls back to dlopen
 // ============================================================================
 
-static BOOL loadPayloadFromPath(NSString *path) {
-    logMessage(@"Attempting to dlopen: %@", path);
-
-    void *handle = dlopen(path.UTF8String, RTLD_LAZY | RTLD_GLOBAL);
-    if (handle) {
-        logMessage(@"SUCCESS: Payload loaded from %@", path);
-        return YES;
-    } else {
-        const char *err = dlerror();
-        logMessage(@"FAILED to dlopen: %s", err ? err : "unknown error");
-        return NO;
+// LiveContainer exports dlopen_nolock() which routes through its JITLess
+// hook (if active). Our own GOT entry for dlopen may not be patched
+// because we were loaded after LC's rebind pass.
+typedef void *(*dlopen_func_t)(const char *, int);
+static dlopen_func_t resolve_dlopen_nolock(void) {
+    void *handle = dlopen(NULL, RTLD_NOW); // get main image handle
+    if (!handle) return NULL;
+    void *sym = dlsym(handle, "dlopen_nolock");
+    if (sym) {
+        logMessage(@"Found LC's dlopen_nolock at %p", sym);
     }
+    return (dlopen_func_t)sym;
+}
+
+static BOOL loadPayloadFromPath(NSString *path) {
+    logMessage(@"Attempting to load: %@", path);
+
+    void *handle = NULL;
+    const char *cpath = path.UTF8String;
+
+    // Try 1: LC's dlopen_nolock (works even if our GOT wasn't patched)
+    dlopen_func_t dl_nolock = resolve_dlopen_nolock();
+    if (dl_nolock) {
+        logMessage(@"Trying dlopen_nolock...");
+        handle = dl_nolock(cpath, RTLD_LAZY | RTLD_GLOBAL);
+        if (handle) {
+            logMessage(@"SUCCESS via dlopen_nolock: %@", path);
+            return YES;
+        }
+        const char *err = dlerror();
+        logMessage(@"dlopen_nolock failed: %s", err ? err : "unknown");
+    }
+
+    // Try 2: Standard dlopen (works in JIT mode where dyld is patched)
+    logMessage(@"Trying standard dlopen...");
+    handle = dlopen(cpath, RTLD_LAZY | RTLD_GLOBAL);
+    if (handle) {
+        logMessage(@"SUCCESS via dlopen: %@", path);
+        return YES;
+    }
+
+    const char *err = dlerror();
+    NSString *errStr = err ? [NSString stringWithUTF8String:err] : @"unknown error";
+    logMessage(@"FAILED: %@", errStr);
+
+    // Provide user-friendly diagnosis
+    if ([errStr containsString:@"code signature"]) {
+        logMessage(@"DIAGNOSIS: The payload dylib is not signed with the correct certificate.");
+        logMessage(@"In JITLess mode, downloaded dylibs MUST be signed with LiveContainer's");
+        logMessage(@"certificate before dlopen. In JIT mode, this should work automatically.");
+        logMessage(@"Solutions: 1) Enable JIT (AltJIT/SideJIT), 2) Sign payload with LC's cert");
+        showOverlayError(@"Code signature invalid\n\nJITLess mode requires signed dylibs.\nEnable JIT or sign the payload\nwith LiveContainer's certificate.");
+    } else {
+        showOverlayError([NSString stringWithFormat:@"dlopen failed:\n%@", errStr]);
+    }
+    return NO;
 }
 
 static void downloadAndLoadPayload(void) {
@@ -478,7 +522,7 @@ static void downloadAndLoadPayload(void) {
     if (success) {
         dismissOverlay(1.2);
     } else {
-        dismissOverlay(3.0); // Show error longer
+        dismissOverlay(5.0); // Show error longer so user can read it
     }
 }
 
