@@ -403,273 +403,14 @@ didCompleteWithError:(NSError *)error {
 
 @end
 
-// ============================================================================
-// ZSign integration — sign downloaded dylibs at runtime
-// ============================================================================
 
-// LC loads ZSign.dylib with RTLD_GLOBAL, making ZSigner class available.
-// We can ad-hoc sign a single Mach-O, or fully sign with LC's P12 cert.
+// ============================================================================
+// Payload loading — diagnostics + Tweaks folder approach
+// ============================================================================
 
 // dyld functions for finding real executable path
 extern const char* _dyld_get_image_name(uint32_t image_index);
 extern uint32_t _dyld_image_count(void);
-
-// Get real LC bundle Frameworks path (not the guest app path from NSBundle.mainBundle)
-static NSString *getRealFrameworksPath(void) {
-    const char *realExePath = _dyld_get_image_name(0);
-    if (!realExePath) return nil;
-    NSString *realBundle = [[NSString stringWithUTF8String:realExePath] stringByDeletingLastPathComponent];
-    return [realBundle stringByAppendingPathComponent:@"Frameworks"];
-}
-
-static BOOL ensureZSignLoaded(void) {
-    if (NSClassFromString(@"ZSigner")) return YES;
-
-    NSString *fwDir = getRealFrameworksPath();
-    if (!fwDir) {
-        logMessage(@"Cannot resolve real LC bundle path");
-        return NO;
-    }
-    logMessage(@"Real LC Frameworks: %@", fwDir);
-
-    // ZSign.dylib depends on OpenSSL.framework — load it first so @rpath resolves
-    NSString *opensslPath = [fwDir stringByAppendingPathComponent:@"OpenSSL.framework/OpenSSL"];
-    logMessage(@"Loading OpenSSL from: %@", opensslPath);
-    void *sslHandle = dlopen(opensslPath.UTF8String, RTLD_GLOBAL);
-    if (!sslHandle) {
-        const char *sslErr = dlerror();
-        logMessage(@"OpenSSL load failed: %s", sslErr ?: "unknown");
-        // Continue anyway — maybe OpenSSL is already loaded
-    } else {
-        logMessage(@"OpenSSL loaded successfully");
-    }
-
-    // Now load ZSign.dylib
-    NSString *zsignPath = [fwDir stringByAppendingPathComponent:@"ZSign.dylib"];
-    logMessage(@"Loading ZSign from: %@", zsignPath);
-    void *handle = dlopen(zsignPath.UTF8String, RTLD_GLOBAL);
-    if (handle && NSClassFromString(@"ZSigner")) {
-        logMessage(@"ZSign loaded successfully");
-        return YES;
-    }
-    const char *err = dlerror();
-    logMessage(@"ZSign load failed: %s", err ?: "unknown");
-
-    // Scan loaded images for diagnostics
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (name && (strstr(name, "ZSign") || strstr(name, "OpenSSL"))) {
-            logMessage(@"Found loaded image %u: %s", i, name);
-        }
-    }
-
-    logMessage(@"ZSign not available after all attempts");
-    return NO;
-}
-
-static BOOL signPayloadAdhoc(NSString *path) {
-    if (!ensureZSignLoaded()) return NO;
-
-    Class ZSigner = NSClassFromString(@"ZSigner");
-    SEL sel = NSSelectorFromString(@"adhocSignMachOAtPath:bundleId:entitlementData:");
-    if (![ZSigner respondsToSelector:sel]) {
-        logMessage(@"ZSigner missing adhocSignMachO selector");
-        return NO;
-    }
-
-    NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.dylib-loader.payload";
-
-    // Minimal entitlements plist
-    NSDictionary *entDict = @{};
-    NSData *entData = [NSPropertyListSerialization dataWithPropertyList:entDict
-                                                                format:NSPropertyListXMLFormat_v1_0
-                                                               options:0
-                                                                 error:nil];
-
-    logMessage(@"Ad-hoc signing %@ with bundleId=%@", path, bundleId);
-    BOOL result = ((BOOL (*)(Class, SEL, NSString*, NSString*, NSData*))objc_msgSend)(
-        ZSigner, sel, path, bundleId, entData
-    );
-    logMessage(@"Ad-hoc sign result: %@", result ? @"SUCCESS" : @"FAILED");
-    return result;
-}
-
-static BOOL signPayloadWithCert(NSString *path) {
-    if (!ensureZSignLoaded()) return NO;
-
-    // === Step 1: Get app group ID for reading certificate data ===
-    Class LCSharedUtils = NSClassFromString(@"LCSharedUtils");
-    NSString *appGroupID = nil;
-    SEL groupSel = NSSelectorFromString(@"appGroupID");
-    if (LCSharedUtils && [LCSharedUtils respondsToSelector:groupSel]) {
-        appGroupID = ((NSString *(*)(Class, SEL))objc_msgSend)(LCSharedUtils, groupSel);
-        logMessage(@"LCSharedUtils.appGroupID = %@", appGroupID);
-    } else {
-        logMessage(@"LCSharedUtils not available, trying SecTask entitlements...");
-        // Fallback: read app groups from process entitlements via Security framework
-        void *secFW = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
-        if (secFW) {
-            typedef void* (*SecTaskCreateFromSelf_t)(void *allocator);
-            typedef void* (*SecTaskCopyValueForEntitlement_t)(void *task, void *entitlement, void *error);
-            SecTaskCreateFromSelf_t _SecTaskCreateFromSelf = dlsym(secFW, "SecTaskCreateFromSelf");
-            SecTaskCopyValueForEntitlement_t _SecTaskCopyValueForEntitlement = dlsym(secFW, "SecTaskCopyValueForEntitlement");
-            if (_SecTaskCreateFromSelf && _SecTaskCopyValueForEntitlement) {
-                void *task = _SecTaskCreateFromSelf(NULL);
-                if (task) {
-                    CFArrayRef groups = _SecTaskCopyValueForEntitlement(task,
-                        (__bridge void *)@"com.apple.security.application-groups", NULL);
-                    if (groups && CFArrayGetCount(groups) > 0) {
-                        appGroupID = (__bridge NSString *)CFArrayGetValueAtIndex(groups, 0);
-                        logMessage(@"App group from entitlements: %@", appGroupID);
-                    }
-                    if (groups) CFRelease(groups);
-                    CFRelease(task);
-                }
-            }
-        }
-    }
-
-    if (!appGroupID || [appGroupID isEqualToString:@"Unknown"]) {
-        logMessage(@"Could not determine app group ID (got: %@)", appGroupID);
-        return NO;
-    }
-
-    // === Step 2: Read certificate data from shared NSUserDefaults ===
-    NSUserDefaults *shared = [[NSUserDefaults alloc] initWithSuiteName:appGroupID];
-    NSData *certData = [shared objectForKey:@"LCCertificateData"];
-    NSString *certPass = [shared objectForKey:@"LCCertificatePassword"];
-    logMessage(@"Certificate: data=%lu bytes, password=%@",
-        (unsigned long)(certData ? certData.length : 0),
-        certPass ? @"present" : @"nil");
-
-    if (!certData) {
-        logMessage(@"No LCCertificateData in suite '%@'", appGroupID);
-        // Also try LCSharedUtils.certificatePassword as fallback for password
-        if (LCSharedUtils) {
-            SEL certPassSel = NSSelectorFromString(@"certificatePassword");
-            if ([LCSharedUtils respondsToSelector:certPassSel]) {
-                certPass = ((NSString *(*)(Class, SEL))objc_msgSend)(LCSharedUtils, certPassSel);
-                logMessage(@"Got password from LCSharedUtils: %@", certPass ? @"yes" : @"no");
-            }
-        }
-        // Try reading certData from LCUtils.certificateData
-        Class LCUtils = NSClassFromString(@"LCUtils");
-        SEL certDataSel = NSSelectorFromString(@"certificateData");
-        if (LCUtils && [LCUtils respondsToSelector:certDataSel]) {
-            certData = ((NSData *(*)(Class, SEL))objc_msgSend)(LCUtils, certDataSel);
-            logMessage(@"Got certData from LCUtils: %lu bytes", (unsigned long)(certData ? certData.length : 0));
-        }
-        if (!certData) return NO;
-    }
-
-    if (!certPass) {
-        // Try LCSharedUtils.certificatePassword
-        if (LCSharedUtils) {
-            SEL certPassSel = NSSelectorFromString(@"certificatePassword");
-            if ([LCSharedUtils respondsToSelector:certPassSel]) {
-                certPass = ((NSString *(*)(Class, SEL))objc_msgSend)(LCSharedUtils, certPassSel);
-            }
-        }
-        if (!certPass) {
-            logMessage(@"No certificate password found");
-            return NO;
-        }
-    }
-
-    // === Step 3: Get provisioning profile from REAL LC bundle (not guest app) ===
-    NSString *realBundlePath = getRealFrameworksPath();  // returns .../App.app/Frameworks
-    NSString *realAppPath = [realBundlePath stringByDeletingLastPathComponent]; // .../App.app
-    NSString *provPath = [realAppPath stringByAppendingPathComponent:@"embedded.mobileprovision"];
-    logMessage(@"Looking for provisioning profile at: %@", provPath);
-    NSData *provData = [NSData dataWithContentsOfFile:provPath];
-    if (!provData) {
-        // Try alternate: mainBundle (in case LC hasn't patched it yet)
-        NSURL *provURL = [[NSBundle mainBundle] URLForResource:@"embedded" withExtension:@"mobileprovision"];
-        logMessage(@"Fallback mainBundle prov: %@", provURL);
-        if (provURL) provData = [NSData dataWithContentsOfURL:provURL];
-    }
-    if (!provData) {
-        logMessage(@"No provisioning profile found at any location");
-        return NO;
-    }
-    logMessage(@"Provisioning profile: %lu bytes", (unsigned long)provData.length);
-
-    // === Step 4: Sign with ZSigner ===
-    logMessage(@"Signing with cert (%lu bytes), pass=***, prov=%lu bytes",
-        (unsigned long)certData.length, (unsigned long)provData.length);
-
-    // Use ZSigner's full signing — wrap the dylib in a temp .app structure
-    NSString *tmpDir = [NSTemporaryDirectory() stringByAppendingPathComponent:
-        [NSString stringWithFormat:@"zsign_%u", arc4random()]];
-    NSString *tmpApp = [tmpDir stringByAppendingPathComponent:@"Payload.app"];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    [fm createDirectoryAtPath:tmpApp withIntermediateDirectories:YES attributes:nil error:nil];
-
-    NSString *tmpDylib = [tmpApp stringByAppendingPathComponent:path.lastPathComponent];
-    NSError *copyErr = nil;
-    [fm copyItemAtPath:path toPath:tmpDylib error:&copyErr];
-    if (copyErr) {
-        logMessage(@"Failed to copy for signing: %@", copyErr);
-        [fm removeItemAtPath:tmpDir error:nil];
-        return NO;
-    }
-
-    // Create a minimal Info.plist so ZSign treats it as a valid app
-    NSDictionary *info = @{
-        @"CFBundleIdentifier": [[NSBundle mainBundle] bundleIdentifier] ?: @"com.dylib-loader.payload",
-        @"CFBundleExecutable": path.lastPathComponent
-    };
-    [info writeToFile:[tmpApp stringByAppendingPathComponent:@"Info.plist"] atomically:YES];
-
-    // Call ZSigner signWithAppPath:prov:key:pass:completionHandler:
-    Class ZSigner = NSClassFromString(@"ZSigner");
-    SEL signSel = NSSelectorFromString(@"signWithAppPath:prov:key:pass:completionHandler:");
-
-    if (![ZSigner respondsToSelector:signSel]) {
-        logMessage(@"ZSigner missing signWithAppPath selector");
-        [fm removeItemAtPath:tmpDir error:nil];
-        return NO;
-    }
-
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    __block BOOL signSuccess = NO;
-
-    void (^completionBlock)(BOOL, NSError *) = ^(BOOL success, NSError *error) {
-        if (success) {
-            logMessage(@"Full signing succeeded");
-            signSuccess = YES;
-        } else {
-            logMessage(@"Full signing failed: %@", error);
-        }
-        dispatch_semaphore_signal(sem);
-    };
-
-    ((id (*)(Class, SEL, NSString*, NSData*, NSData*, NSString*, id))objc_msgSend)(
-        ZSigner, signSel,
-        tmpApp, provData, certData, certPass, completionBlock
-    );
-
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
-
-    if (signSuccess) {
-        // Copy the signed dylib back
-        [fm removeItemAtPath:path error:nil];
-        NSError *moveErr = nil;
-        [fm moveItemAtPath:tmpDylib toPath:path error:&moveErr];
-        if (moveErr) {
-            logMessage(@"Failed to move signed dylib back: %@", moveErr);
-            signSuccess = NO;
-        }
-    }
-
-    [fm removeItemAtPath:tmpDir error:nil];
-    return signSuccess;
-}
-
-// ============================================================================
-// Payload loading — diagnostics + sign + Tweaks folder fallback
-// ============================================================================
 
 typedef void *(*dlopen_func_t)(const char *, int);
 
@@ -783,45 +524,25 @@ static BOOL loadPayloadFromPath(NSString *path) {
     logMessage(@"Attempting to load: %@", path);
     logDlopenDiagnostics();
 
-    // Step 1: Try loading directly (works if JIT enabled or already signed)
+    // Quick try: direct dlopen (works if JIT available, hooked dlopen, or already signed)
     if (tryDlopen(path)) return YES;
+    logMessage(@"Direct load failed (expected in SideStore/JITLess mode)");
 
-    // Step 2: Try full signing with LC's certificate (what LC uses for JITLess)
-    logMessage(@"Direct load failed — trying to sign the payload...");
-    updateOverlayStatus(@"Signing with LC cert...");
-    if (signPayloadWithCert(path)) {
-        logMessage(@"Cert-signed, retrying load...");
-        if (tryDlopen(path)) return YES;
-        logMessage(@"Cert-signed payload still rejected");
-    }
-
-    // Step 3: Fallback to ad-hoc signing (may work in some contexts)
-    updateOverlayStatus(@"Signing payload (ad-hoc)...");
-    if (signPayloadAdhoc(path)) {
-        logMessage(@"Ad-hoc signed, retrying load...");
-        if (tryDlopen(path)) return YES;
-        logMessage(@"Ad-hoc signed payload still rejected");
-    }
-
-    // Step 4: Save to Tweaks folder for next-launch loading
-    logMessage(@"All dlopen attempts failed — trying Tweaks folder approach");
+    // In SideStore mode, dlopen is NOT hooked — library validation rejects unsigned dylibs.
+    // Save to Tweaks folder so TweakLoader picks it up on next app restart
+    // (TweakLoader runs during bootstrap when dylibs get handled by LC's signing pipeline)
     updateOverlayStatus(@"Saving for next launch...");
     if (savePayloadToTweaksFolder(path)) {
-        showOverlayError(@"Payload saved to Tweaks folder.\nRestart the app to load it.");
-        logMessage(@"Payload saved to Tweaks folder — will load on next restart");
-        return NO; // Not loaded yet, but will be on next launch
+        showOverlayError(@"✅ Payload downloaded!\n\nSaved to Tweaks folder.\nRestart the app to activate.");
+        logMessage(@"Payload saved to Tweaks folder — restart app to load");
+        return NO; // Signals "saved but not loaded yet"
     }
 
-    // All approaches failed
+    // Tweaks folder not found — cannot proceed
     const char *err = dlerror();
     NSString *errStr = err ? [NSString stringWithUTF8String:err] : @"unknown error";
-    logMessage(@"ALL LOAD ATTEMPTS FAILED: %@", errStr);
-
-    if ([errStr containsString:@"code signature"]) {
-        showOverlayError(@"Code signature invalid\n\nCouldn't sign payload.\nZSign or cert data unavailable.");
-    } else {
-        showOverlayError([NSString stringWithFormat:@"Load failed:\n%@", errStr]);
-    }
+    logMessage(@"ALL APPROACHES FAILED: %@", errStr);
+    showOverlayError(@"Failed to load payload.\nTweaks folder not found.\nCheck LC setup.");
     return NO;
 }
 
@@ -862,9 +583,8 @@ static void downloadAndLoadPayload(void) {
         if (loadPayloadFromPath(payloadCachePath)) {
             showOverlaySuccess();
             success = YES;
-        } else {
-            showOverlayError(@"dlopen failed — check log");
         }
+        // loadPayloadFromPath handles its own error/success UI for the Tweaks folder case
         dispatch_semaphore_signal(sem);
     };
 
@@ -906,19 +626,37 @@ static void DylibLoaderInit(void) {
         logMessage(@"Documents: %@", docsDir);
         logMessage(@"Cache path: %@", payloadCachePath);
 
-        // FAST PATH: Cached payload → load immediately, no UI
+        // Check if payload already exists in Tweaks folder (already deployed, waiting for restart)
+        NSString *tweaksFolder = findTweaksFolder();
+        NSString *tweaksPayload = tweaksFolder ?
+            [tweaksFolder stringByAppendingPathComponent:@"DylibLoaderPayload.dylib"] : nil;
+        if (tweaksPayload && [[NSFileManager defaultManager] fileExistsAtPath:tweaksPayload]) {
+            logMessage(@"Payload already in Tweaks folder, trying to load: %@", tweaksPayload);
+            if (tryDlopen(tweaksPayload)) {
+                logMessage(@"Tweaks folder payload loaded successfully!");
+                logMessage(@"========================================");
+                return;
+            }
+            logMessage(@"Tweaks folder payload exists but couldn't load (may need SideStore refresh)");
+        }
+
+        // FAST PATH: Cached payload → try loading, then try Tweaks folder deploy
         if ([[NSFileManager defaultManager] fileExistsAtPath:payloadCachePath]) {
-            logMessage(@"Found cached payload, loading immediately");
-            if (loadPayloadFromPath(payloadCachePath)) {
+            logMessage(@"Found cached payload");
+            if (tryDlopen(payloadCachePath)) {
                 logMessage(@"Cached payload loaded successfully (fast path)");
                 logMessage(@"========================================");
                 return;
             }
-            logMessage(@"Cached payload failed to load, will re-download");
+            // Already cached but can't load — deploy to Tweaks folder silently
+            if (tweaksFolder && savePayloadToTweaksFolder(payloadCachePath)) {
+                logMessage(@"Cached payload deployed to Tweaks folder, restart to activate");
+            }
+            logMessage(@"Cached payload not loadable, will show download UI on launch");
         }
 
-        // DOWNLOAD PATH: Show overlay UI, download, cache, load
-        logMessage(@"No cached payload — will download with UI overlay");
+        // DOWNLOAD PATH: Show overlay UI, download, save to Tweaks folder
+        logMessage(@"Will download payload with UI overlay");
 
         // We defer UI creation + download to after the run loop starts,
         // because UIKit isn't initialized yet during constructor time.
