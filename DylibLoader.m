@@ -413,16 +413,46 @@ didCompleteWithError:(NSError *)error {
 static BOOL ensureZSignLoaded(void) {
     if (NSClassFromString(@"ZSigner")) return YES;
 
-    // ZSign.dylib might not be loaded yet — try loading it from Frameworks/
-    NSString *fwPath = [NSBundle.mainBundle.bundlePath
-        stringByAppendingPathComponent:@"Frameworks/ZSign.dylib"];
-    logMessage(@"Loading ZSign from: %@", fwPath);
-    void *handle = dlopen(fwPath.UTF8String, RTLD_GLOBAL);
+    // Method 1: Use @executable_path token — dyld resolves this to the REAL
+    // LC binary location (not the guest app path that NSBundle.mainBundle returns)
+    logMessage(@"Loading ZSign via @executable_path...");
+    void *handle = dlopen("@executable_path/Frameworks/ZSign.dylib", RTLD_GLOBAL);
     if (handle && NSClassFromString(@"ZSigner")) {
-        logMessage(@"ZSign loaded successfully");
+        logMessage(@"ZSign loaded via @executable_path");
         return YES;
     }
-    logMessage(@"ZSign not available (handle=%p, class=%p)", handle, NSClassFromString(@"ZSigner"));
+    const char *err1 = dlerror();
+    logMessage(@"@executable_path failed: %s", err1 ?: "unknown");
+
+    // Method 2: Resolve real executable path via _dyld_get_image_name(0)
+    extern const char* _dyld_get_image_name(uint32_t image_index);
+    const char *realExePath = _dyld_get_image_name(0);
+    if (realExePath) {
+        NSString *realBundle = [[NSString stringWithUTF8String:realExePath] stringByDeletingLastPathComponent];
+        NSString *fwPath = [realBundle stringByAppendingPathComponent:@"Frameworks/ZSign.dylib"];
+        logMessage(@"Loading ZSign from real path: %@", fwPath);
+        handle = dlopen(fwPath.UTF8String, RTLD_GLOBAL);
+        if (handle && NSClassFromString(@"ZSigner")) {
+            logMessage(@"ZSign loaded from real path");
+            return YES;
+        }
+        const char *err2 = dlerror();
+        logMessage(@"Real path failed: %s", err2 ?: "unknown");
+    }
+
+    // Method 3: Fallback — scan loaded images for ZSign.dylib
+    extern uint32_t _dyld_image_count(void);
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "ZSign.dylib")) {
+            logMessage(@"ZSign already loaded as image %u: %s", i, name);
+            // It's loaded but ZSigner class not found — weird but log it
+            break;
+        }
+    }
+
+    logMessage(@"ZSign not available after all attempts");
     return NO;
 }
 
