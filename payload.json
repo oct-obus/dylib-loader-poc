@@ -1,4 +1,5 @@
 {
+  "name": "Example Payload",
   "version": 4,
   "url": "https://raw.githubusercontent.com/oct-obus/dylib-loader-poc/master/ExamplePayload.dylib",
   "bundle_id": null

@@ -1,11 +1,10 @@
-// DylibLoader - LiveContainer-compatible payload injector
+// DylibLoader - Multi-dylib manager for LiveContainer
 //
-// Downloads and loads a remote dylib payload inside LiveContainer apps.
-// Uses a manifest (payload.json) for version-based auto-updates.
-// Shows a draggable floating panel with download status.
+// Manages multiple payload dylibs: add by manifest URL, toggle enable/disable,
+// auto-update from remote manifests, deploy to LC Tweaks folder.
+// Shows a draggable floating panel with per-dylib status.
 //
-// Build with Theos or compile manually for arm64.
-// Place in LiveContainer's Tweaks folder.
+// Build with Theos for arm64. Place in LiveContainer's Tweaks folder.
 
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
@@ -17,47 +16,109 @@
 // Configuration
 // ============================================================================
 
-#define MANIFEST_URL    @"https://raw.githubusercontent.com/oct-obus/dylib-loader-poc/master/payload.json"
-#define PAYLOAD_FILENAME @"cached_payload.dylib"
-#define VERSION_KEY     @"DylibLoaderPayloadVersion"
-#define LOG_FILENAME    @"dylib_loader.log"
+#define CONFIG_FILENAME   @"dylib_manager.json"
+#define LOG_FILENAME      @"dylib_loader.log"
+#define TWEAKS_PAYLOAD_PREFIX @"DLM_"
 
-// Floating panel config
-#define PANEL_WIDTH         280.0
-#define PANEL_HEIGHT_FULL   170.0
-#define PANEL_HEIGHT_MINI    36.0
+// Panel config
+#define PANEL_WIDTH         300.0
+#define PANEL_MIN_HEIGHT     60.0
+#define PANEL_MAX_HEIGHT    400.0
 #define PANEL_CORNER_RADIUS  14.0
 #define PANEL_MARGIN_TOP     60.0
-#define PANEL_MARGIN_RIGHT   16.0
+#define PANEL_MARGIN_RIGHT   12.0
+#define ROW_HEIGHT           64.0
+#define HEADER_HEIGHT        40.0
+#define FOOTER_HEIGHT        44.0
 
 // Colors
 #define COLOR_ACCENT    0x00FF88
 #define COLOR_INFO      0x55AAFF
 #define COLOR_ERROR     0xFF4444
 #define COLOR_BG        0x1A1A2E
+#define COLOR_ROW_BG    0x252540
+#define COLOR_DISABLED  0x666680
 
 // ============================================================================
 // Forward declarations
 // ============================================================================
 
-@class UIWindow, UIView, UILabel, UIProgressView, UIColor, UIFont,
-       UIScreen, UIApplication, UIBlurEffect, UIVisualEffectView;
+@class UIWindow, UIView, UILabel, UISwitch, UIButton, UIScrollView,
+       UIColor, UIFont, UIScreen, UIApplication, UIBlurEffect,
+       UIVisualEffectView, UIAlertController, UIAlertAction, UITextField;
+
+// ============================================================================
+// Data Model
+// ============================================================================
+
+@interface DLMEntry : NSObject
+@property (nonatomic, strong) NSString *entryId;
+@property (atomic, strong) NSString *name;
+@property (nonatomic, strong) NSString *manifestURL;
+@property (atomic, strong) NSString *dylibURL;
+@property (atomic, strong) NSString *bundleId;
+@property (atomic, assign) NSInteger version;
+@property (nonatomic, assign) BOOL enabled;
+@property (atomic, strong) NSString *status; // "idle", "loaded", "pending_restart", "downloading", "error"
+@property (atomic, strong) NSString *errorDetail;
+@end
+
+@implementation DLMEntry
+- (instancetype)initWithDict:(NSDictionary *)dict {
+    if (self = [super init]) {
+        _entryId = dict[@"id"] ?: [[NSUUID UUID] UUIDString];
+        _name = dict[@"name"] ?: @"Unknown";
+        _manifestURL = dict[@"manifest_url"] ?: @"";
+        _dylibURL = dict[@"dylib_url"] ?: @"";
+        _bundleId = dict[@"bundle_id"];
+        _version = [dict[@"version"] integerValue];
+        _enabled = dict[@"enabled"] ? [dict[@"enabled"] boolValue] : YES;
+        _status = dict[@"status"] ?: @"idle";
+        _errorDetail = dict[@"error_detail"];
+    }
+    return self;
+}
+- (NSDictionary *)toDict {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    d[@"id"] = self.entryId;
+    d[@"name"] = self.name;
+    d[@"manifest_url"] = self.manifestURL;
+    d[@"dylib_url"] = self.dylibURL;
+    if (self.bundleId) d[@"bundle_id"] = self.bundleId;
+    d[@"version"] = @(self.version);
+    d[@"enabled"] = @(self.enabled);
+    d[@"status"] = self.status;
+    if (self.errorDetail) d[@"error_detail"] = self.errorDetail;
+    return d;
+}
+- (NSString *)tweaksFilename {
+    // Sanitize name for filesystem
+    NSString *safe = [[self.name componentsSeparatedByCharactersInSet:
+        [[NSCharacterSet alphanumericCharacterSet] invertedSet]] componentsJoinedByString:@"_"];
+    return [NSString stringWithFormat:@"%@%@.dylib", TWEAKS_PAYLOAD_PREFIX, safe];
+}
+- (NSString *)cacheFilename {
+    return [NSString stringWithFormat:@"dlm_cache_%@.dylib", self.entryId];
+}
+@end
 
 // ============================================================================
 // State
 // ============================================================================
 
 static NSString *logFilePath = nil;
-static NSString *payloadCachePath = nil;
-static NSString *restartCountKey = @"DylibLoaderRestartCount";
+static NSString *configFilePath = nil;
+static NSString *docsDir = nil;
+static NSMutableArray<DLMEntry *> *entries = nil;
 
+// UI
 static id floatingWindow = nil;
-static id statusLabel = nil;
-static id detailLabel = nil;
-static id progressBar = nil;
-static id panelView = nil;
+static id scrollView = nil;
+static id headerView = nil;
 static BOOL panelMinimized = NO;
 static CGRect panelExpandedFrame;
+static id gestureHandler = nil;
+static Class gestureHandlerClass = Nil;
 
 // ============================================================================
 // Logging
@@ -88,7 +149,49 @@ static void logMessage(NSString *format, ...) {
 }
 
 // ============================================================================
-// UIKit helpers (all via runtime to avoid hard link)
+// Persistence
+// ============================================================================
+
+static void saveConfig(void) {
+    NSMutableArray *arr = [NSMutableArray array];
+    @synchronized(entries) {
+        for (DLMEntry *e in entries) {
+            [arr addObject:[e toDict]];
+        }
+    }
+    NSError *err = nil;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:arr options:NSJSONWritingPrettyPrinted error:&err];
+    if (err) {
+        logMessage(@"ERROR: Failed to serialize config: %@", err.localizedDescription);
+        return;
+    }
+    [data writeToFile:configFilePath atomically:YES];
+    logMessage(@"Config saved (%lu entries)", (unsigned long)arr.count);
+}
+
+static void loadConfig(void) {
+    entries = [NSMutableArray array];
+    NSData *data = [NSData dataWithContentsOfFile:configFilePath];
+    if (!data) {
+        logMessage(@"No config file, starting fresh");
+        return;
+    }
+    NSError *err = nil;
+    NSArray *arr = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+    if (err || ![arr isKindOfClass:[NSArray class]]) {
+        logMessage(@"ERROR: Config parse failed: %@", err.localizedDescription);
+        return;
+    }
+    for (NSDictionary *dict in arr) {
+        if ([dict isKindOfClass:[NSDictionary class]]) {
+            [entries addObject:[[DLMEntry alloc] initWithDict:dict]];
+        }
+    }
+    logMessage(@"Config loaded: %lu entries", (unsigned long)entries.count);
+}
+
+// ============================================================================
+// UIKit helpers
 // ============================================================================
 
 static id colorFromHex(uint32_t hex, CGFloat alpha) {
@@ -104,56 +207,348 @@ static id colorFromHex(uint32_t hex, CGFloat alpha) {
 
 static id systemFont(CGFloat size) {
     return ((id (*)(Class, SEL, CGFloat))objc_msgSend)(
-        NSClassFromString(@"UIFont"), NSSelectorFromString(@"systemFontOfSize:"), size
-    );
+        NSClassFromString(@"UIFont"), NSSelectorFromString(@"systemFontOfSize:"), size);
 }
 
 static id boldFont(CGFloat size) {
     return ((id (*)(Class, SEL, CGFloat))objc_msgSend)(
-        NSClassFromString(@"UIFont"), NSSelectorFromString(@"boldSystemFontOfSize:"), size
-    );
+        NSClassFromString(@"UIFont"), NSSelectorFromString(@"boldSystemFontOfSize:"), size);
 }
 
 static id monoFont(CGFloat size) {
     return ((id (*)(Class, SEL, CGFloat, CGFloat))objc_msgSend)(
         NSClassFromString(@"UIFont"),
         NSSelectorFromString(@"monospacedSystemFontOfSize:weight:"),
-        size, 0.0
-    );
+        size, 0.0);
+}
+
+static id makeLabel(CGRect frame, NSString *text, id font, id color) {
+    Class cls = NSClassFromString(@"UILabel");
+    id lbl = ((id (*)(Class, SEL, CGRect))objc_msgSend)([cls alloc], NSSelectorFromString(@"initWithFrame:"), frame);
+    ((void (*)(id, SEL, id))objc_msgSend)(lbl, NSSelectorFromString(@"setText:"), text);
+    ((void (*)(id, SEL, id))objc_msgSend)(lbl, NSSelectorFromString(@"setFont:"), font);
+    ((void (*)(id, SEL, id))objc_msgSend)(lbl, NSSelectorFromString(@"setTextColor:"), color);
+    return lbl;
+}
+
+// ============================================================================
+// Tweaks folder
+// ============================================================================
+
+extern const char* _dyld_get_image_name(uint32_t image_index);
+extern uint32_t _dyld_image_count(void);
+
+static NSString *findTweaksFolder(void) {
+    const char *envFolder = getenv("LC_GLOBAL_TWEAKS_FOLDER");
+    if (envFolder) return [NSString stringWithUTF8String:envFolder];
+
+    const char *lcHome = getenv("LC_HOME_PATH");
+    if (!lcHome) lcHome = getenv("LP_HOME_PATH");
+    if (lcHome) {
+        NSString *tweaks = [[NSString stringWithUTF8String:lcHome] stringByAppendingPathComponent:@"Tweaks"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:tweaks]) return tweaks;
+    }
+
+    NSString *d = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    if (d) {
+        NSString *parent = d;
+        for (int i = 0; i < 6; i++) {
+            parent = [parent stringByDeletingLastPathComponent];
+            NSString *tweaks = [parent stringByAppendingPathComponent:@"Tweaks"];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:tweaks]) return tweaks;
+        }
+    }
+    logMessage(@"ERROR: Could not locate Tweaks folder");
+    return nil;
+}
+
+static BOOL deployToTweaks(NSString *sourcePath, NSString *tweaksFilename) {
+    NSString *tweaksFolder = findTweaksFolder();
+    if (!tweaksFolder) return NO;
+    NSString *dest = [tweaksFolder stringByAppendingPathComponent:tweaksFilename];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm removeItemAtPath:dest error:nil];
+    NSError *err = nil;
+    [fm copyItemAtPath:sourcePath toPath:dest error:&err];
+    if (err) {
+        logMessage(@"ERROR: Deploy to Tweaks failed: %@ -> %@: %@", sourcePath, dest, err.localizedDescription);
+        return NO;
+    }
+    logMessage(@"Deployed to Tweaks: %@", dest);
+    return YES;
+}
+
+static void removeFromTweaks(NSString *tweaksFilename) {
+    NSString *tweaksFolder = findTweaksFolder();
+    if (!tweaksFolder) return;
+    NSString *path = [tweaksFolder stringByAppendingPathComponent:tweaksFilename];
+    NSError *err = nil;
+    [[NSFileManager defaultManager] removeItemAtPath:path error:&err];
+    if (err && err.code != NSFileNoSuchFileError) {
+        logMessage(@"WARNING: Failed to remove %@: %@", path, err.localizedDescription);
+    } else {
+        logMessage(@"Removed from Tweaks: %@", path);
+    }
+}
+
+static BOOL tryDlopen(NSString *path) {
+    void *handle = dlopen(path.UTF8String, RTLD_LAZY | RTLD_GLOBAL);
+    if (handle) {
+        logMessage(@"dlopen OK: %@", path);
+        return YES;
+    }
+    logMessage(@"dlopen failed: %@ (%s)", path, dlerror() ?: "unknown");
+    return NO;
+}
+
+// ============================================================================
+// Manifest fetch
+// ============================================================================
+
+static NSDictionary *fetchManifest(NSString *url) {
+    NSURL *nsurl = [NSURL URLWithString:url];
+    if (!nsurl) return nil;
+    NSURLRequest *req = [NSURLRequest requestWithURL:nsurl
+                                         cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                     timeoutInterval:10.0];
+    __block NSData *resultData = nil;
+    __block NSError *resultError = nil;
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            resultData = data;
+            resultError = error;
+            dispatch_semaphore_signal(sem);
+        }];
+    [task resume];
+    long r = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+    if (r != 0 || resultError || !resultData) {
+        logMessage(@"Manifest fetch failed for %@: %@", url,
+            resultError.localizedDescription ?: @"timeout");
+        return nil;
+    }
+    NSError *parseErr = nil;
+    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:resultData options:0 error:&parseErr];
+    if (parseErr || ![json isKindOfClass:[NSDictionary class]]) return nil;
+    return json;
+}
+
+// ============================================================================
+// Download helper (synchronous, with progress logging)
+// ============================================================================
+
+@interface DLMDownloadDelegate : NSObject <NSURLSessionDownloadDelegate>
+@property (nonatomic, copy) void (^completion)(NSURL *location, NSError *error);
+@property (nonatomic, copy) void (^progressBlock)(float progress);
+@end
+
+@implementation DLMDownloadDelegate
+- (void)URLSession:(NSURLSession *)session
+      downloadTask:(NSURLSessionDownloadTask *)downloadTask
+      didWriteData:(int64_t)bytesWritten
+ totalBytesWritten:(int64_t)totalBytesWritten
+totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
+    if (totalBytesExpectedToWrite > 0 && self.progressBlock) {
+        self.progressBlock((float)totalBytesWritten / (float)totalBytesExpectedToWrite);
+    }
+}
+- (void)URLSession:(NSURLSession *)session
+      downloadTask:(NSURLSessionDownloadTask *)downloadTask
+didFinishDownloadingToURL:(NSURL *)location {
+    NSHTTPURLResponse *resp = (NSHTTPURLResponse *)downloadTask.response;
+    if (resp.statusCode == 200) {
+        if (self.completion) self.completion(location, nil);
+    } else {
+        NSError *err = [NSError errorWithDomain:@"DylibLoader" code:resp.statusCode
+            userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"HTTP %ld", (long)resp.statusCode]}];
+        if (self.completion) self.completion(nil, err);
+    }
+}
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    if (error && self.completion) self.completion(nil, error);
+}
+@end
+
+static BOOL downloadFile(NSString *urlString, NSString *destPath) {
+    logMessage(@"Downloading %@ -> %@", urlString, destPath);
+    DLMDownloadDelegate *delegate = [[DLMDownloadDelegate alloc] init];
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block BOOL success = NO;
+
+    delegate.completion = ^(NSURL *location, NSError *error) {
+        if (error) {
+            logMessage(@"Download error: %@", error.localizedDescription);
+            dispatch_semaphore_signal(sem);
+            return;
+        }
+        NSError *moveErr = nil;
+        [[NSFileManager defaultManager] removeItemAtPath:destPath error:nil];
+        [[NSFileManager defaultManager] moveItemAtURL:location
+                                                toURL:[NSURL fileURLWithPath:destPath]
+                                                error:&moveErr];
+        if (moveErr) {
+            logMessage(@"ERROR: Move failed: %@", moveErr.localizedDescription);
+        } else {
+            success = YES;
+        }
+        dispatch_semaphore_signal(sem);
+    };
+
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    config.timeoutIntervalForResource = 30.0;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config delegate:delegate delegateQueue:nil];
+    NSURLSessionDownloadTask *task = [session downloadTaskWithURL:[NSURL URLWithString:urlString]];
+    [task resume];
+    long r = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 35 * NSEC_PER_SEC));
+    if (r != 0) {
+        // Timeout: cancel the task and nil completion to prevent late writes
+        delegate.completion = nil;
+        [task cancel];
+    }
+    [session finishTasksAndInvalidate];
+    return success;
+}
+
+// ============================================================================
+// Per-entry processing
+// ============================================================================
+
+static void processEntry(DLMEntry *entry) {
+    NSString *currentBundle = [[NSBundle mainBundle] bundleIdentifier];
+
+    // Bundle filter
+    if (entry.bundleId && entry.bundleId.length > 0) {
+        if (![entry.bundleId isEqualToString:currentBundle]) {
+            logMessage(@"[%@] Bundle filter skip: target=%@ current=%@", entry.name, entry.bundleId, currentBundle);
+            return;
+        }
+    }
+
+    if (!entry.enabled) {
+        logMessage(@"[%@] Disabled, removing from Tweaks", entry.name);
+        removeFromTweaks([entry tweaksFilename]);
+        entry.status = @"idle";
+        return;
+    }
+
+    NSString *cachePath = [docsDir stringByAppendingPathComponent:[entry cacheFilename]];
+    NSString *tweaksFolder = findTweaksFolder();
+    NSString *tweaksPath = tweaksFolder ?
+        [tweaksFolder stringByAppendingPathComponent:[entry tweaksFilename]] : nil;
+
+    // Try loading from Tweaks (already signed by LC)
+    if (tweaksPath && [[NSFileManager defaultManager] fileExistsAtPath:tweaksPath]) {
+        if (tryDlopen(tweaksPath)) {
+            entry.status = @"loaded";
+            logMessage(@"[%@] Loaded from Tweaks", entry.name);
+            return;
+        }
+        logMessage(@"[%@] In Tweaks but dlopen failed (unsigned)", entry.name);
+    }
+
+    // Try loading from cache
+    if ([[NSFileManager defaultManager] fileExistsAtPath:cachePath]) {
+        if (tryDlopen(cachePath)) {
+            entry.status = @"loaded";
+            logMessage(@"[%@] Loaded from cache", entry.name);
+            return;
+        }
+    }
+
+    // Check manifest for updates
+    entry.status = @"checking";
+    NSDictionary *manifest = fetchManifest(entry.manifestURL);
+    if (manifest) {
+        NSInteger remoteVersion = 0;
+        id vv = manifest[@"version"];
+        if ([vv isKindOfClass:[NSNumber class]]) remoteVersion = [vv integerValue];
+
+        id nameVal = manifest[@"name"];
+        if ([nameVal isKindOfClass:[NSString class]] && [nameVal length] > 0) {
+            entry.name = nameVal;
+        }
+        id bundleVal = manifest[@"bundle_id"];
+        if ([bundleVal isKindOfClass:[NSString class]] && [bundleVal length] > 0) {
+            entry.bundleId = bundleVal;
+        } else {
+            entry.bundleId = nil;
+        }
+        id urlVal = manifest[@"url"];
+        if ([urlVal isKindOfClass:[NSString class]] && [urlVal length] > 0) {
+            entry.dylibURL = urlVal;
+        }
+
+        if (remoteVersion > entry.version && entry.dylibURL.length > 0) {
+            logMessage(@"[%@] Update: v%ld -> v%ld", entry.name, (long)entry.version, (long)remoteVersion);
+            entry.status = @"downloading";
+            if (downloadFile(entry.dylibURL, cachePath)) {
+                entry.version = remoteVersion;
+                deployToTweaks(cachePath, [entry tweaksFilename]);
+                // Try immediate load
+                if (tryDlopen(cachePath)) {
+                    entry.status = @"loaded";
+                } else {
+                    entry.status = @"pending_restart";
+                }
+            } else {
+                entry.status = @"error";
+                entry.errorDetail = @"Download failed";
+            }
+        } else if (remoteVersion <= entry.version) {
+            // Up to date but not loaded
+            if ([[NSFileManager defaultManager] fileExistsAtPath:cachePath]) {
+                deployToTweaks(cachePath, [entry tweaksFilename]);
+            }
+            entry.status = @"pending_restart";
+        }
+    } else {
+        // Manifest unreachable
+        if ([[NSFileManager defaultManager] fileExistsAtPath:cachePath]) {
+            deployToTweaks(cachePath, [entry tweaksFilename]);
+            entry.status = @"pending_restart";
+        } else {
+            entry.status = @"error";
+            entry.errorDetail = @"Server unreachable, no cache";
+        }
+    }
 }
 
 // ============================================================================
 // Runtime class for gesture/button handling
 // ============================================================================
 
+static void rebuildUI(void);
+
 static void handlePanGesture(id self, SEL _cmd, id gesture) {
     if (!floatingWindow) return;
-
     CGPoint trans = ((CGPoint (*)(id, SEL, id))objc_msgSend)(
         gesture, sel_registerName("translationInView:"),
-        ((id (*)(id, SEL))objc_msgSend)(gesture, sel_registerName("view"))
-    );
-
+        ((id (*)(id, SEL))objc_msgSend)(gesture, sel_registerName("view")));
     CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("frame"));
     frame.origin.x += trans.x;
     frame.origin.y += trans.y;
     ((void (*)(id, SEL, CGRect))objc_msgSend)(floatingWindow, sel_registerName("setFrame:"), frame);
-
     CGPoint zero = {0, 0};
     ((void (*)(id, SEL, CGPoint, id))objc_msgSend)(
         gesture, sel_registerName("setTranslation:inView:"), zero,
-        ((id (*)(id, SEL))objc_msgSend)(gesture, sel_registerName("view"))
-    );
-
-    if (!panelMinimized) {
-        panelExpandedFrame = frame;
-    }
+        ((id (*)(id, SEL))objc_msgSend)(gesture, sel_registerName("view")));
+    if (!panelMinimized) panelExpandedFrame = frame;
 }
 
-static void toggleMinimize(void);
-
 static void handleMinimizeTap(id self, SEL _cmd) {
-    toggleMinimize();
+    if (!floatingWindow) return;
+    panelMinimized = !panelMinimized;
+    CGRect frame = ((CGRect (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("frame"));
+    if (panelMinimized) {
+        frame.size.height = HEADER_HEIGHT;
+    } else {
+        frame.size.height = panelExpandedFrame.size.height;
+    }
+    ((void (*)(Class, SEL, double, void(^)(void)))objc_msgSend)(
+        NSClassFromString(@"UIView"), NSSelectorFromString(@"animateWithDuration:animations:"),
+        0.25,
+        ^{ ((void (*)(id, SEL, CGRect))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setFrame:"), frame); }
+    );
 }
 
 static void handleCloseTap(id self, SEL _cmd) {
@@ -165,684 +560,369 @@ static void handleCloseTap(id self, SEL _cmd) {
         ^{ ((void (*)(id, SEL, CGFloat))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setAlpha:"), 0.0); },
         ^(BOOL finished) {
             ((void (*)(id, SEL, BOOL))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setHidden:"), YES);
-            floatingWindow = nil;
-            statusLabel = nil;
-            detailLabel = nil;
-            progressBar = nil;
-            panelView = nil;
+            floatingWindow = nil; scrollView = nil; headerView = nil;
         }
     );
 }
 
-static Class gestureHandlerClass = Nil;
+static void handleAddTap(id self, SEL _cmd) {
+    // Show UIAlertController with text field for manifest URL
+    Class AC = objc_getClass("UIAlertController");
+    Class AA = objc_getClass("UIAlertAction");
+    id alert = ((id (*)(id, SEL, id, id, long))objc_msgSend)(
+        (id)AC, sel_registerName("alertControllerWithTitle:message:preferredStyle:"),
+        @"Add Dylib", @"Enter the manifest URL (payload.json)", 1);
 
-static void registerGestureHandlerClass(void) {
+    ((void (*)(id, SEL, void(^)(id)))objc_msgSend)(
+        alert, sel_registerName("addTextFieldWithConfigurationHandler:"),
+        ^(id textField) {
+            ((void (*)(id, SEL, id))objc_msgSend)(textField, sel_registerName("setPlaceholder:"), @"https://example.com/payload.json");
+            ((void (*)(id, SEL, NSInteger))objc_msgSend)(textField, sel_registerName("setKeyboardType:"), 3); // URL
+            ((void (*)(id, SEL, NSInteger))objc_msgSend)(textField, sel_registerName("setAutocorrectionType:"), 1); // No
+        });
+
+    id addAction = ((id (*)(id, SEL, id, long, id))objc_msgSend)(
+        (id)AA, sel_registerName("actionWithTitle:style:handler:"),
+        @"Add", 0,
+        ^(id action) {
+            NSArray *fields = ((id (*)(id, SEL))objc_msgSend)(alert, sel_registerName("textFields"));
+            id textField = [fields firstObject];
+            NSString *url = ((id (*)(id, SEL))objc_msgSend)(textField, sel_registerName("text"));
+            if (!url || url.length == 0) return;
+
+            logMessage(@"Adding new entry from manifest: %@", url);
+            DLMEntry *entry = [[DLMEntry alloc] initWithDict:@{
+                @"manifest_url": url,
+                @"name": @"Loading...",
+                @"enabled": @YES,
+                @"status": @"idle"
+            }];
+            @synchronized(entries) {
+                [entries addObject:entry];
+            }
+            saveConfig();
+
+            // Process on background thread
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                processEntry(entry);
+                saveConfig();
+                dispatch_async(dispatch_get_main_queue(), ^{ rebuildUI(); });
+            });
+        });
+
+    id cancelAction = ((id (*)(id, SEL, id, long, id))objc_msgSend)(
+        (id)AA, sel_registerName("actionWithTitle:style:handler:"),
+        @"Cancel", 1, nil);
+
+    ((void (*)(id, SEL, id))objc_msgSend)(alert, sel_registerName("addAction:"), addAction);
+    ((void (*)(id, SEL, id))objc_msgSend)(alert, sel_registerName("addAction:"), cancelAction);
+
+    // Present on the floating window's root VC
+    if (floatingWindow) {
+        id rootVC = ((id (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("rootViewController"));
+        if (rootVC) {
+            ((void (*)(id, SEL, id, BOOL, id))objc_msgSend)(
+                rootVC, sel_registerName("presentViewController:animated:completion:"),
+                alert, YES, nil);
+        }
+    }
+}
+
+static void handleToggle(id self, SEL _cmd, id sender) {
+    NSInteger tag = ((NSInteger (*)(id, SEL))objc_msgSend)(sender, sel_registerName("tag"));
+    DLMEntry *entry = nil;
+    @synchronized(entries) {
+        if (tag >= 0 && tag < (NSInteger)entries.count) {
+            entry = entries[tag];
+        }
+    }
+    if (!entry) return;
+    BOOL isOn = ((BOOL (*)(id, SEL))objc_msgSend)(sender, sel_registerName("isOn"));
+    entry.enabled = isOn;
+    logMessage(@"[%@] %@", entry.name, isOn ? @"Enabled" : @"Disabled");
+    if (!isOn) {
+        removeFromTweaks([entry tweaksFilename]);
+        entry.status = @"idle";
+    }
+    saveConfig();
+    dispatch_async(dispatch_get_main_queue(), ^{ rebuildUI(); });
+}
+
+static void handleDeleteTap(id self, SEL _cmd, id sender) {
+    NSInteger tag = ((NSInteger (*)(id, SEL))objc_msgSend)(sender, sel_registerName("tag"));
+    DLMEntry *entry = nil;
+    @synchronized(entries) {
+        if (tag >= 0 && tag < (NSInteger)entries.count) {
+            entry = entries[tag];
+        }
+    }
+    if (!entry) return;
+    logMessage(@"Deleting entry: %@", entry.name);
+    removeFromTweaks([entry tweaksFilename]);
+    NSString *cache = [docsDir stringByAppendingPathComponent:[entry cacheFilename]];
+    [[NSFileManager defaultManager] removeItemAtPath:cache error:nil];
+    @synchronized(entries) {
+        [entries removeObject:entry];
+    }
+    saveConfig();
+    dispatch_async(dispatch_get_main_queue(), ^{ rebuildUI(); });
+}
+
+static void registerHandlerClass(void) {
     if (gestureHandlerClass) return;
-    gestureHandlerClass = objc_allocateClassPair([NSObject class], "DLGestureHandler", 0);
+    gestureHandlerClass = objc_allocateClassPair([NSObject class], "DLMHandler", 0);
     class_addMethod(gestureHandlerClass, sel_registerName("handlePan:"), (IMP)handlePanGesture, "v@:@");
     class_addMethod(gestureHandlerClass, sel_registerName("handleMinimize"), (IMP)handleMinimizeTap, "v@:");
     class_addMethod(gestureHandlerClass, sel_registerName("handleClose"), (IMP)handleCloseTap, "v@:");
+    class_addMethod(gestureHandlerClass, sel_registerName("handleAdd"), (IMP)handleAddTap, "v@:");
+    class_addMethod(gestureHandlerClass, sel_registerName("handleToggle:"), (IMP)handleToggle, "v@:@");
+    class_addMethod(gestureHandlerClass, sel_registerName("handleDelete:"), (IMP)handleDeleteTap, "v@:@");
     objc_registerClassPair(gestureHandlerClass);
 }
 
-static id gestureHandler = nil;
-
 // ============================================================================
-// Floating Panel UI
+// UI Construction
 // ============================================================================
 
-static id makeButton(NSString *title, CGRect frame, SEL action, uint32_t color) {
-    Class UIButtonClass = NSClassFromString(@"UIButton");
-    id btn = ((id (*)(Class, SEL, NSInteger))objc_msgSend)(
-        UIButtonClass, NSSelectorFromString(@"buttonWithType:"), 0
-    );
-    ((void (*)(id, SEL, CGRect))objc_msgSend)(btn, NSSelectorFromString(@"setFrame:"), frame);
-    ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(
-        btn, NSSelectorFromString(@"setTitle:forState:"), title, 0
-    );
-    id titleLbl = ((id (*)(id, SEL))objc_msgSend)(btn, NSSelectorFromString(@"titleLabel"));
-    ((void (*)(id, SEL, id))objc_msgSend)(titleLbl, NSSelectorFromString(@"setFont:"), boldFont(16));
-    ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(
-        btn, NSSelectorFromString(@"setTitleColor:forState:"), colorFromHex(color, 0.9), 0
-    );
-    ((void (*)(id, SEL, id, SEL, NSInteger))objc_msgSend)(
-        btn, NSSelectorFromString(@"addTarget:action:forControlEvents:"),
-        gestureHandler, action, (NSInteger)64 /* UIControlEventTouchUpInside */
-    );
-    return btn;
+static id statusColor(NSString *status) {
+    if ([status isEqualToString:@"loaded"]) return colorFromHex(COLOR_ACCENT, 1.0);
+    if ([status isEqualToString:@"pending_restart"]) return colorFromHex(COLOR_INFO, 1.0);
+    if ([status isEqualToString:@"downloading"] || [status isEqualToString:@"checking"])
+        return colorFromHex(COLOR_INFO, 0.7);
+    if ([status isEqualToString:@"error"]) return colorFromHex(COLOR_ERROR, 1.0);
+    return colorFromHex(COLOR_DISABLED, 1.0);
+}
+
+static NSString *statusText(DLMEntry *entry) {
+    if ([entry.status isEqualToString:@"loaded"]) return @"Active";
+    if ([entry.status isEqualToString:@"pending_restart"]) return @"Restart LC";
+    if ([entry.status isEqualToString:@"downloading"]) return @"Downloading";
+    if ([entry.status isEqualToString:@"checking"]) return @"Checking";
+    if ([entry.status isEqualToString:@"error"]) return entry.errorDetail ?: @"Error";
+    return entry.enabled ? @"Idle" : @"Disabled";
+}
+
+static id makeHeaderButton(NSString *title, CGFloat x, CGFloat w, SEL action, uint32_t color) {
+    Class btn = NSClassFromString(@"UIButton");
+    id b = ((id (*)(Class, SEL, NSInteger))objc_msgSend)(btn, NSSelectorFromString(@"buttonWithType:"), 0);
+    ((void (*)(id, SEL, CGRect))objc_msgSend)(b, NSSelectorFromString(@"setFrame:"),
+        CGRectMake(x, 6, w, 28));
+    ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(b, NSSelectorFromString(@"setTitle:forState:"), title, 0);
+    id lbl = ((id (*)(id, SEL))objc_msgSend)(b, NSSelectorFromString(@"titleLabel"));
+    ((void (*)(id, SEL, id))objc_msgSend)(lbl, NSSelectorFromString(@"setFont:"), boldFont(14));
+    ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(b, NSSelectorFromString(@"setTitleColor:forState:"),
+        colorFromHex(color, 0.9), 0);
+    ((void (*)(id, SEL, id, SEL, NSInteger))objc_msgSend)(b, NSSelectorFromString(@"addTarget:action:forControlEvents:"),
+        gestureHandler, action, (NSInteger)64);
+    return b;
+}
+
+static id makeEntryRow(DLMEntry *entry, NSInteger index, CGFloat yOffset) {
+    Class UIViewClass = NSClassFromString(@"UIView");
+    Class UISwitchClass = NSClassFromString(@"UISwitch");
+
+    CGRect rowFrame = CGRectMake(0, yOffset, PANEL_WIDTH, ROW_HEIGHT);
+    id row = ((id (*)(Class, SEL, CGRect))objc_msgSend)([UIViewClass alloc],
+        NSSelectorFromString(@"initWithFrame:"), rowFrame);
+    ((void (*)(id, SEL, id))objc_msgSend)(row, NSSelectorFromString(@"setBackgroundColor:"),
+        colorFromHex(COLOR_ROW_BG, (index % 2 == 0) ? 0.5 : 0.3));
+
+    // Toggle switch
+    id toggle = ((id (*)(id, SEL))objc_msgSend)([UISwitchClass alloc], NSSelectorFromString(@"init"));
+    ((void (*)(id, SEL, CGRect))objc_msgSend)(toggle, NSSelectorFromString(@"setFrame:"),
+        CGRectMake(8, (ROW_HEIGHT - 31) / 2, 51, 31));
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(toggle, NSSelectorFromString(@"setOn:"), entry.enabled);
+    ((void (*)(id, SEL, id))objc_msgSend)(toggle, NSSelectorFromString(@"setOnTintColor:"),
+        colorFromHex(COLOR_ACCENT, 1.0));
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(toggle, NSSelectorFromString(@"setTag:"), index);
+    ((void (*)(id, SEL, id, SEL, NSInteger))objc_msgSend)(toggle,
+        NSSelectorFromString(@"addTarget:action:forControlEvents:"),
+        gestureHandler, sel_registerName("handleToggle:"), (NSInteger)(1 << 12)); // ValueChanged
+    // Scale down the switch
+    CGAffineTransform t = CGAffineTransformMakeScale(0.7, 0.7);
+    ((void (*)(id, SEL, CGAffineTransform))objc_msgSend)(toggle, NSSelectorFromString(@"setTransform:"), t);
+
+    // Name + version
+    NSString *nameStr = [NSString stringWithFormat:@"%@ v%ld", entry.name, (long)entry.version];
+    id nameLbl = makeLabel(CGRectMake(58, 4, PANEL_WIDTH - 100, 20),
+        nameStr, boldFont(13), colorFromHex(0xFFFFFF, 0.95));
+
+    // Status
+    id statusLbl = makeLabel(CGRectMake(58, 24, PANEL_WIDTH - 100, 16),
+        statusText(entry), systemFont(11), statusColor(entry.status));
+
+    // Source URL (truncated)
+    NSString *urlDisplay = entry.manifestURL;
+    if (urlDisplay.length > 40) urlDisplay = [[urlDisplay substringToIndex:37] stringByAppendingString:@"..."];
+    id urlLbl = makeLabel(CGRectMake(58, 42, PANEL_WIDTH - 100, 14),
+        urlDisplay, monoFont(9), colorFromHex(0xFFFFFF, 0.3));
+
+    // Delete button
+    Class btnClass = NSClassFromString(@"UIButton");
+    id delBtn = ((id (*)(Class, SEL, NSInteger))objc_msgSend)(btnClass, NSSelectorFromString(@"buttonWithType:"), 0);
+    ((void (*)(id, SEL, CGRect))objc_msgSend)(delBtn, NSSelectorFromString(@"setFrame:"),
+        CGRectMake(PANEL_WIDTH - 36, (ROW_HEIGHT - 24) / 2, 28, 24));
+    ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(delBtn, NSSelectorFromString(@"setTitle:forState:"), @"x", 0);
+    id delLbl = ((id (*)(id, SEL))objc_msgSend)(delBtn, NSSelectorFromString(@"titleLabel"));
+    ((void (*)(id, SEL, id))objc_msgSend)(delLbl, NSSelectorFromString(@"setFont:"), boldFont(14));
+    ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(delBtn, NSSelectorFromString(@"setTitleColor:forState:"),
+        colorFromHex(COLOR_ERROR, 0.7), 0);
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(delBtn, NSSelectorFromString(@"setTag:"), index);
+    ((void (*)(id, SEL, id, SEL, NSInteger))objc_msgSend)(delBtn,
+        NSSelectorFromString(@"addTarget:action:forControlEvents:"),
+        gestureHandler, sel_registerName("handleDelete:"), (NSInteger)64);
+
+    ((void (*)(id, SEL, id))objc_msgSend)(row, NSSelectorFromString(@"addSubview:"), toggle);
+    ((void (*)(id, SEL, id))objc_msgSend)(row, NSSelectorFromString(@"addSubview:"), nameLbl);
+    ((void (*)(id, SEL, id))objc_msgSend)(row, NSSelectorFromString(@"addSubview:"), statusLbl);
+    ((void (*)(id, SEL, id))objc_msgSend)(row, NSSelectorFromString(@"addSubview:"), urlLbl);
+    ((void (*)(id, SEL, id))objc_msgSend)(row, NSSelectorFromString(@"addSubview:"), delBtn);
+
+    return row;
+}
+
+static void rebuildUI(void) {
+    if (!floatingWindow) return;
+
+    id rootVC = ((id (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("rootViewController"));
+    id rootView = ((id (*)(id, SEL))objc_msgSend)(rootVC, NSSelectorFromString(@"view"));
+
+    // Remove old content
+    NSArray *subviews = ((id (*)(id, SEL))objc_msgSend)(rootView, NSSelectorFromString(@"subviews"));
+    for (id sv in subviews) {
+        ((void (*)(id, SEL))objc_msgSend)(sv, NSSelectorFromString(@"removeFromSuperview"));
+    }
+
+    CGFloat entryCount;
+    @synchronized(entries) {
+        entryCount = entries.count;
+    }
+    CGFloat contentHeight = HEADER_HEIGHT + entryCount * ROW_HEIGHT + FOOTER_HEIGHT;
+    CGFloat panelHeight = fmin(fmax(contentHeight, PANEL_MIN_HEIGHT), PANEL_MAX_HEIGHT);
+
+    // Blur background
+    Class UIBlurEffectClass = NSClassFromString(@"UIBlurEffect");
+    Class UIVisualEffectViewClass = NSClassFromString(@"UIVisualEffectView");
+    id blurEffect = ((id (*)(Class, SEL, NSInteger))objc_msgSend)(
+        UIBlurEffectClass, NSSelectorFromString(@"effectWithStyle:"), 2);
+    id blurView = ((id (*)(Class, SEL, id))objc_msgSend)(
+        [UIVisualEffectViewClass alloc], NSSelectorFromString(@"initWithEffect:"), blurEffect);
+    ((void (*)(id, SEL, CGRect))objc_msgSend)(blurView, NSSelectorFromString(@"setFrame:"),
+        CGRectMake(0, 0, PANEL_WIDTH, panelHeight));
+    id blurLayer = ((id (*)(id, SEL))objc_msgSend)(blurView, NSSelectorFromString(@"layer"));
+    ((void (*)(id, SEL, CGFloat))objc_msgSend)(blurLayer, NSSelectorFromString(@"setCornerRadius:"), PANEL_CORNER_RADIUS);
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(blurLayer, NSSelectorFromString(@"setMasksToBounds:"), YES);
+
+    id contentView = ((id (*)(id, SEL))objc_msgSend)(blurView, NSSelectorFromString(@"contentView"));
+
+    // Header
+    id titleLbl = makeLabel(CGRectMake(12, 8, PANEL_WIDTH - 100, 24),
+        @"DylibLoader", boldFont(15), colorFromHex(COLOR_ACCENT, 1.0));
+    ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), titleLbl);
+
+    // Header buttons
+    id addBtn = makeHeaderButton(@"+", PANEL_WIDTH - 94, 28, sel_registerName("handleAdd"), COLOR_ACCENT);
+    id minBtn = makeHeaderButton(@"-", PANEL_WIDTH - 62, 28, sel_registerName("handleMinimize"), 0xFFFFFF);
+    id closeBtn = makeHeaderButton(@"x", PANEL_WIDTH - 32, 28, sel_registerName("handleClose"), 0xFF6666);
+    ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), addBtn);
+    ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), minBtn);
+    ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), closeBtn);
+
+    // Scrollable content area
+    Class UIScrollViewClass = NSClassFromString(@"UIScrollView");
+    CGFloat scrollHeight = panelHeight - HEADER_HEIGHT;
+    scrollView = ((id (*)(Class, SEL, CGRect))objc_msgSend)(
+        [UIScrollViewClass alloc], NSSelectorFromString(@"initWithFrame:"),
+        CGRectMake(0, HEADER_HEIGHT, PANEL_WIDTH, scrollHeight));
+
+    // Entry rows
+    NSArray *snapshot = nil;
+    @synchronized(entries) {
+        snapshot = [entries copy];
+    }
+    CGFloat y = 0;
+    for (NSInteger i = 0; i < (NSInteger)snapshot.count; i++) {
+        id row = makeEntryRow(snapshot[i], i, y);
+        ((void (*)(id, SEL, id))objc_msgSend)(scrollView, NSSelectorFromString(@"addSubview:"), row);
+        y += ROW_HEIGHT;
+    }
+
+    // Empty state
+    if (snapshot.count == 0) {
+        id emptyLbl = makeLabel(CGRectMake(0, 20, PANEL_WIDTH, 20),
+            @"No dylibs configured", systemFont(13), colorFromHex(0xFFFFFF, 0.4));
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(emptyLbl, NSSelectorFromString(@"setTextAlignment:"), 1);
+        ((void (*)(id, SEL, id))objc_msgSend)(scrollView, NSSelectorFromString(@"addSubview:"), emptyLbl);
+
+        id hintLbl = makeLabel(CGRectMake(0, 42, PANEL_WIDTH, 16),
+            @"Tap + to add a manifest URL", systemFont(11), colorFromHex(0xFFFFFF, 0.25));
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(hintLbl, NSSelectorFromString(@"setTextAlignment:"), 1);
+        ((void (*)(id, SEL, id))objc_msgSend)(scrollView, NSSelectorFromString(@"addSubview:"), hintLbl);
+        y = 70;
+    }
+
+    CGSize contentSize = {PANEL_WIDTH, y};
+    ((void (*)(id, SEL, CGSize))objc_msgSend)(scrollView, NSSelectorFromString(@"setContentSize:"), contentSize);
+
+    ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), scrollView);
+    ((void (*)(id, SEL, id))objc_msgSend)(rootView, NSSelectorFromString(@"addSubview:"), blurView);
+
+    // Update window frame
+    CGRect wf = ((CGRect (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("frame"));
+    wf.size.height = panelMinimized ? HEADER_HEIGHT : panelHeight;
+    ((void (*)(id, SEL, CGRect))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setFrame:"), wf);
+    if (!panelMinimized) panelExpandedFrame = wf;
 }
 
 static void createFloatingPanel(void) {
-    if (floatingWindow) return;
+    if (floatingWindow) { rebuildUI(); return; }
 
-    registerGestureHandlerClass();
+    registerHandlerClass();
     if (!gestureHandler) {
         gestureHandler = ((id (*)(id, SEL))objc_msgSend)([gestureHandlerClass alloc], sel_registerName("init"));
     }
 
     Class UIWindowClass = NSClassFromString(@"UIWindow");
-    Class UIViewClass = NSClassFromString(@"UIView");
-    Class UILabelClass = NSClassFromString(@"UILabel");
-    Class UIProgressViewClass = NSClassFromString(@"UIProgressView");
     Class UIScreenClass = NSClassFromString(@"UIScreen");
-    Class UIBlurEffectClass = NSClassFromString(@"UIBlurEffect");
-    Class UIVisualEffectViewClass = NSClassFromString(@"UIVisualEffectView");
-
-    if (!UIWindowClass || !UIScreenClass) {
-        logMessage(@"UIKit not available, cannot create panel");
-        return;
-    }
+    if (!UIWindowClass || !UIScreenClass) return;
 
     id mainScreen = ((id (*)(Class, SEL))objc_msgSend)(UIScreenClass, NSSelectorFromString(@"mainScreen"));
     CGRect screenBounds = ((CGRect (*)(id, SEL))objc_msgSend)(mainScreen, NSSelectorFromString(@"bounds"));
 
-    // Position: top-right area of the screen
     CGFloat panelX = screenBounds.size.width - PANEL_WIDTH - PANEL_MARGIN_RIGHT;
     CGFloat panelY = PANEL_MARGIN_TOP;
-    CGRect windowFrame = CGRectMake(panelX, panelY, PANEL_WIDTH, PANEL_HEIGHT_FULL);
-    panelExpandedFrame = windowFrame;
+    CGFloat initialH = PANEL_MIN_HEIGHT;
+    CGRect wf = CGRectMake(panelX, panelY, PANEL_WIDTH, initialH);
 
-    // Create floating window (sized to panel only, touches pass through elsewhere)
     floatingWindow = ((id (*)(Class, SEL, CGRect))objc_msgSend)(
-        [UIWindowClass alloc], NSSelectorFromString(@"initWithFrame:"), windowFrame
-    );
+        [UIWindowClass alloc], NSSelectorFromString(@"initWithFrame:"), wf);
     ((void (*)(id, SEL, CGFloat))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setWindowLevel:"), (CGFloat)10000000.0);
     ((void (*)(id, SEL, id))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setBackgroundColor:"),
         ((id (*)(Class, SEL))objc_msgSend)(NSClassFromString(@"UIColor"), NSSelectorFromString(@"clearColor")));
 
-    // Root view controller (required by iOS)
-    Class UIViewControllerClass = NSClassFromString(@"UIViewController");
-    id rootVC = ((id (*)(id, SEL))objc_msgSend)([UIViewControllerClass alloc], NSSelectorFromString(@"init"));
+    Class UIVC = NSClassFromString(@"UIViewController");
+    id rootVC = ((id (*)(id, SEL))objc_msgSend)([UIVC alloc], NSSelectorFromString(@"init"));
     ((void (*)(id, SEL, id))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setRootViewController:"), rootVC);
 
-    // Blur panel background
-    CGRect localFrame = CGRectMake(0, 0, PANEL_WIDTH, PANEL_HEIGHT_FULL);
-    id blurEffect = ((id (*)(Class, SEL, NSInteger))objc_msgSend)(
-        UIBlurEffectClass, NSSelectorFromString(@"effectWithStyle:"), 2 /* Dark */
-    );
-    panelView = ((id (*)(Class, SEL, id))objc_msgSend)(
-        [UIVisualEffectViewClass alloc], NSSelectorFromString(@"initWithEffect:"), blurEffect
-    );
-    ((void (*)(id, SEL, CGRect))objc_msgSend)(panelView, NSSelectorFromString(@"setFrame:"), localFrame);
-
-    id panelLayer = ((id (*)(id, SEL))objc_msgSend)(panelView, NSSelectorFromString(@"layer"));
-    ((void (*)(id, SEL, CGFloat))objc_msgSend)(panelLayer, NSSelectorFromString(@"setCornerRadius:"), PANEL_CORNER_RADIUS);
-    ((void (*)(id, SEL, BOOL))objc_msgSend)(panelLayer, NSSelectorFromString(@"setMasksToBounds:"), YES);
-
-    // Add a subtle border
-    ((void (*)(id, SEL, CGFloat))objc_msgSend)(panelLayer, NSSelectorFromString(@"setBorderWidth:"), 0.5);
-    id borderCGColor = ((id (*)(id, SEL))objc_msgSend)(colorFromHex(0xFFFFFF, 0.15), NSSelectorFromString(@"CGColor"));
-    ((void (*)(id, SEL, id))objc_msgSend)(panelLayer, NSSelectorFromString(@"setBorderColor:"), borderCGColor);
-
-    id contentView = ((id (*)(id, SEL))objc_msgSend)(panelView, NSSelectorFromString(@"contentView"));
-
-    // Title: "DylibLoader" (left-aligned)
-    id titleLabel = ((id (*)(Class, SEL, CGRect))objc_msgSend)(
-        [UILabelClass alloc], NSSelectorFromString(@"initWithFrame:"),
-        CGRectMake(14, 8, PANEL_WIDTH - 80, 24)
-    );
-    ((void (*)(id, SEL, id))objc_msgSend)(titleLabel, NSSelectorFromString(@"setText:"), @"DylibLoader");
-    ((void (*)(id, SEL, id))objc_msgSend)(titleLabel, NSSelectorFromString(@"setFont:"), boldFont(15));
-    ((void (*)(id, SEL, id))objc_msgSend)(titleLabel, NSSelectorFromString(@"setTextColor:"),
-        colorFromHex(COLOR_ACCENT, 1.0));
-
-    // Minimize button (-)
-    id minBtn = makeButton(@"-", CGRectMake(PANEL_WIDTH - 64, 4, 28, 28),
-        sel_registerName("handleMinimize"), 0xFFFFFF);
-
-    // Close button (x)
-    id closeBtn = makeButton(@"x", CGRectMake(PANEL_WIDTH - 32, 4, 28, 28),
-        sel_registerName("handleClose"), 0xFF6666);
-
-    // Status label
-    statusLabel = ((id (*)(Class, SEL, CGRect))objc_msgSend)(
-        [UILabelClass alloc], NSSelectorFromString(@"initWithFrame:"),
-        CGRectMake(14, 38, PANEL_WIDTH - 28, 20)
-    );
-    ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setText:"), @"Initializing...");
-    ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setFont:"), systemFont(13));
-    ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setTextColor:"),
-        colorFromHex(0xFFFFFF, 0.9));
-
-    // Progress bar
-    progressBar = ((id (*)(Class, SEL, CGRect))objc_msgSend)(
-        [UIProgressViewClass alloc], NSSelectorFromString(@"initWithFrame:"),
-        CGRectMake(14, 66, PANEL_WIDTH - 28, 4)
-    );
-    ((void (*)(id, SEL, id))objc_msgSend)(progressBar, NSSelectorFromString(@"setProgressTintColor:"),
-        colorFromHex(COLOR_ACCENT, 1.0));
-    ((void (*)(id, SEL, id))objc_msgSend)(progressBar, NSSelectorFromString(@"setTrackTintColor:"),
-        colorFromHex(0xFFFFFF, 0.1));
-    ((void (*)(id, SEL, float))objc_msgSend)(progressBar, NSSelectorFromString(@"setProgress:"), 0.0f);
-
-    // Detail label (multi-line)
-    detailLabel = ((id (*)(Class, SEL, CGRect))objc_msgSend)(
-        [UILabelClass alloc], NSSelectorFromString(@"initWithFrame:"),
-        CGRectMake(14, 80, PANEL_WIDTH - 28, 80)
-    );
-    ((void (*)(id, SEL, id))objc_msgSend)(detailLabel, NSSelectorFromString(@"setText:"), @"");
-    ((void (*)(id, SEL, id))objc_msgSend)(detailLabel, NSSelectorFromString(@"setFont:"), monoFont(10));
-    ((void (*)(id, SEL, id))objc_msgSend)(detailLabel, NSSelectorFromString(@"setTextColor:"),
-        colorFromHex(0xFFFFFF, 0.5));
-    ((void (*)(id, SEL, NSInteger))objc_msgSend)(detailLabel, NSSelectorFromString(@"setNumberOfLines:"), 0);
-
-    // Assemble
-    ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), titleLabel);
-    ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), minBtn);
-    ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), closeBtn);
-    ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), statusLabel);
-    ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), progressBar);
-    ((void (*)(id, SEL, id))objc_msgSend)(contentView, NSSelectorFromString(@"addSubview:"), detailLabel);
-
-    id rootView = ((id (*)(id, SEL))objc_msgSend)(rootVC, NSSelectorFromString(@"view"));
-    ((void (*)(id, SEL, id))objc_msgSend)(rootView, NSSelectorFromString(@"addSubview:"), panelView);
-
-    // Pan gesture for dragging
+    // Pan gesture
     Class UIPanClass = NSClassFromString(@"UIPanGestureRecognizer");
-    id panGesture = ((id (*)(id, SEL, id, SEL))objc_msgSend)(
+    id pan = ((id (*)(id, SEL, id, SEL))objc_msgSend)(
         [UIPanClass alloc], NSSelectorFromString(@"initWithTarget:action:"),
-        gestureHandler, sel_registerName("handlePan:")
-    );
-    ((void (*)(id, SEL, id))objc_msgSend)(floatingWindow, NSSelectorFromString(@"addGestureRecognizer:"), panGesture);
+        gestureHandler, sel_registerName("handlePan:"));
+    ((void (*)(id, SEL, id))objc_msgSend)(floatingWindow, NSSelectorFromString(@"addGestureRecognizer:"), pan);
 
-    // Fade in
     ((void (*)(id, SEL, CGFloat))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setAlpha:"), 0.0);
     ((void (*)(id, SEL, BOOL))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setHidden:"), NO);
     ((void (*)(id, SEL))objc_msgSend)(floatingWindow, NSSelectorFromString(@"makeKeyAndVisible"));
 
+    panelMinimized = NO;
+    rebuildUI();
+
     ((void (*)(Class, SEL, double, void(^)(void)))objc_msgSend)(
-        NSClassFromString(@"UIView"),
-        NSSelectorFromString(@"animateWithDuration:animations:"),
+        NSClassFromString(@"UIView"), NSSelectorFromString(@"animateWithDuration:animations:"),
         0.3,
         ^{ ((void (*)(id, SEL, CGFloat))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setAlpha:"), 1.0); }
     );
-
-    panelMinimized = NO;
-}
-
-static void toggleMinimize(void) {
-    if (!floatingWindow) return;
-
-    panelMinimized = !panelMinimized;
-
-    if (panelMinimized) {
-        // Collapse to small pill
-        CGRect miniFrame = ((CGRect (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("frame"));
-        miniFrame.size.height = PANEL_HEIGHT_MINI;
-
-        ((void (*)(Class, SEL, double, void(^)(void)))objc_msgSend)(
-            NSClassFromString(@"UIView"),
-            NSSelectorFromString(@"animateWithDuration:animations:"),
-            0.25,
-            ^{
-                ((void (*)(id, SEL, CGRect))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setFrame:"), miniFrame);
-                if (statusLabel) ((void (*)(id, SEL, CGFloat))objc_msgSend)(statusLabel, NSSelectorFromString(@"setAlpha:"), 0.0);
-                if (progressBar) ((void (*)(id, SEL, CGFloat))objc_msgSend)(progressBar, NSSelectorFromString(@"setAlpha:"), 0.0);
-                if (detailLabel) ((void (*)(id, SEL, CGFloat))objc_msgSend)(detailLabel, NSSelectorFromString(@"setAlpha:"), 0.0);
-                CGRect panelLocal = CGRectMake(0, 0, PANEL_WIDTH, PANEL_HEIGHT_MINI);
-                ((void (*)(id, SEL, CGRect))objc_msgSend)(panelView, NSSelectorFromString(@"setFrame:"), panelLocal);
-            }
-        );
-    } else {
-        // Expand back
-        CGRect expandFrame = panelExpandedFrame;
-        expandFrame.origin = ((CGRect (*)(id, SEL))objc_msgSend)(floatingWindow, sel_registerName("frame")).origin;
-        expandFrame.size.height = PANEL_HEIGHT_FULL;
-
-        ((void (*)(Class, SEL, double, void(^)(void)))objc_msgSend)(
-            NSClassFromString(@"UIView"),
-            NSSelectorFromString(@"animateWithDuration:animations:"),
-            0.25,
-            ^{
-                ((void (*)(id, SEL, CGRect))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setFrame:"), expandFrame);
-                if (statusLabel) ((void (*)(id, SEL, CGFloat))objc_msgSend)(statusLabel, NSSelectorFromString(@"setAlpha:"), 1.0);
-                if (progressBar) ((void (*)(id, SEL, CGFloat))objc_msgSend)(progressBar, NSSelectorFromString(@"setAlpha:"), 1.0);
-                if (detailLabel) ((void (*)(id, SEL, CGFloat))objc_msgSend)(detailLabel, NSSelectorFromString(@"setAlpha:"), 1.0);
-                CGRect panelLocal = CGRectMake(0, 0, PANEL_WIDTH, PANEL_HEIGHT_FULL);
-                ((void (*)(id, SEL, CGRect))objc_msgSend)(panelView, NSSelectorFromString(@"setFrame:"), panelLocal);
-            }
-        );
-    }
-}
-
-// ============================================================================
-// Status display helpers
-// ============================================================================
-
-static void updateStatus(NSString *text) {
-    if (!statusLabel) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setText:"), text);
-        ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setTextColor:"),
-            colorFromHex(0xFFFFFF, 0.9));
-    });
-}
-
-static void updateDetail(NSString *text) {
-    if (!detailLabel) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        ((void (*)(id, SEL, id))objc_msgSend)(detailLabel, NSSelectorFromString(@"setText:"), text);
-    });
-}
-
-static void updateProgress(float progress) {
-    if (!progressBar) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        ((void (*)(id, SEL, float, BOOL))objc_msgSend)(
-            progressBar, NSSelectorFromString(@"setProgress:animated:"), progress, YES
-        );
-    });
-}
-
-static void showSuccess(NSString *msg) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (statusLabel) {
-            ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setText:"), msg ?: @"Loaded");
-            ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setTextColor:"),
-                colorFromHex(COLOR_ACCENT, 1.0));
-        }
-        if (progressBar) {
-            ((void (*)(id, SEL, id))objc_msgSend)(progressBar, NSSelectorFromString(@"setProgressTintColor:"),
-                colorFromHex(COLOR_ACCENT, 1.0));
-            ((void (*)(id, SEL, float, BOOL))objc_msgSend)(
-                progressBar, NSSelectorFromString(@"setProgress:animated:"), 1.0f, YES);
-        }
-    });
-}
-
-static void showInfo(NSString *msg) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (statusLabel) {
-            ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setText:"), msg);
-            ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setTextColor:"),
-                colorFromHex(COLOR_INFO, 1.0));
-        }
-        if (progressBar) {
-            ((void (*)(id, SEL, id))objc_msgSend)(progressBar, NSSelectorFromString(@"setProgressTintColor:"),
-                colorFromHex(COLOR_INFO, 1.0));
-        }
-    });
-}
-
-static void showError(NSString *msg, NSString *detail) {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (statusLabel) {
-            ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setText:"), msg);
-            ((void (*)(id, SEL, id))objc_msgSend)(statusLabel, NSSelectorFromString(@"setTextColor:"),
-                colorFromHex(COLOR_ERROR, 1.0));
-        }
-        if (detail && detailLabel) {
-            ((void (*)(id, SEL, id))objc_msgSend)(detailLabel, NSSelectorFromString(@"setText:"), detail);
-            ((void (*)(id, SEL, id))objc_msgSend)(detailLabel, NSSelectorFromString(@"setTextColor:"),
-                colorFromHex(COLOR_ERROR, 0.7));
-        }
-        if (progressBar) {
-            ((void (*)(id, SEL, id))objc_msgSend)(progressBar, NSSelectorFromString(@"setProgressTintColor:"),
-                colorFromHex(COLOR_ERROR, 1.0));
-        }
-    });
-}
-
-static void autoDismiss(double delay) {
-    if (!floatingWindow) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        if (!floatingWindow) return;
-        ((void (*)(Class, SEL, double, void(^)(void), void(^)(BOOL)))objc_msgSend)(
-            NSClassFromString(@"UIView"),
-            NSSelectorFromString(@"animateWithDuration:animations:completion:"),
-            0.3,
-            ^{ ((void (*)(id, SEL, CGFloat))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setAlpha:"), 0.0); },
-            ^(BOOL finished) {
-                ((void (*)(id, SEL, BOOL))objc_msgSend)(floatingWindow, NSSelectorFromString(@"setHidden:"), YES);
-                floatingWindow = nil;
-                statusLabel = nil;
-                detailLabel = nil;
-                progressBar = nil;
-                panelView = nil;
-            }
-        );
-    });
-}
-
-// ============================================================================
-// Download delegate
-// ============================================================================
-
-@interface DLDownloadDelegate : NSObject <NSURLSessionDownloadDelegate>
-@property (nonatomic, copy) void (^completion)(NSURL *location, NSError *error);
-@property (nonatomic, assign) CFAbsoluteTime startTime;
-@end
-
-@implementation DLDownloadDelegate
-
-- (void)URLSession:(NSURLSession *)session
-      downloadTask:(NSURLSessionDownloadTask *)downloadTask
-      didWriteData:(int64_t)bytesWritten
- totalBytesWritten:(int64_t)totalBytesWritten
-totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
-
-    float progress = 0.0;
-    NSString *detail = @"";
-
-    if (totalBytesExpectedToWrite > 0) {
-        progress = (float)totalBytesWritten / (float)totalBytesExpectedToWrite;
-        double elapsed = CFAbsoluteTimeGetCurrent() - self.startTime;
-        double speed = (elapsed > 0) ? (totalBytesWritten / elapsed) : 0;
-        detail = [NSString stringWithFormat:@"%.1f / %.1f KB  %.0f KB/s",
-            totalBytesWritten / 1024.0,
-            totalBytesExpectedToWrite / 1024.0,
-            speed / 1024.0];
-    } else {
-        detail = [NSString stringWithFormat:@"%.1f KB received", totalBytesWritten / 1024.0];
-        progress = 0.1 + 0.8 * (sin(CFAbsoluteTimeGetCurrent() * 2.0) * 0.5 + 0.5);
-    }
-
-    updateStatus(@"Downloading...");
-    updateProgress(progress);
-    updateDetail(detail);
-}
-
-- (void)URLSession:(NSURLSession *)session
-      downloadTask:(NSURLSessionDownloadTask *)downloadTask
-didFinishDownloadingToURL:(NSURL *)location {
-    NSHTTPURLResponse *httpResponse = (NSHTTPURLResponse *)downloadTask.response;
-    logMessage(@"Download complete, HTTP %ld, location: %@", (long)httpResponse.statusCode, location.path);
-
-    if (httpResponse.statusCode == 200) {
-        if (self.completion) self.completion(location, nil);
-    } else {
-        NSError *err = [NSError errorWithDomain:@"DylibLoader"
-                                           code:httpResponse.statusCode
-                                       userInfo:@{NSLocalizedDescriptionKey:
-                            [NSString stringWithFormat:@"Server returned HTTP %ld", (long)httpResponse.statusCode]}];
-        if (self.completion) self.completion(nil, err);
-    }
-}
-
-- (void)URLSession:(NSURLSession *)session
-              task:(NSURLSessionTask *)task
-didCompleteWithError:(NSError *)error {
-    if (error) {
-        logMessage(@"Download error: domain=%@ code=%ld desc=%@",
-            error.domain, (long)error.code, error.localizedDescription);
-        if (self.completion) self.completion(nil, error);
-    }
-}
-
-@end
-
-// ============================================================================
-// Payload loading logic
-// ============================================================================
-
-extern const char* _dyld_get_image_name(uint32_t image_index);
-extern uint32_t _dyld_image_count(void);
-
-static void logDlopenDiagnostics(void) {
-    Dl_info dlopenInfo;
-    void *our_dlopen = dlsym(RTLD_DEFAULT, "dlopen");
-    if (our_dlopen && dladdr(our_dlopen, &dlopenInfo)) {
-        logMessage(@"dlopen -> %s in %s (addr %p)",
-            dlopenInfo.dli_sname ?: "?", dlopenInfo.dli_fname ?: "?", our_dlopen);
-        if (strstr(dlopenInfo.dli_sname ?: "", "hook") || strstr(dlopenInfo.dli_sname ?: "", "jitless")) {
-            logMessage(@"dlopen IS hooked by LC (bypass active)");
-        } else {
-            logMessage(@"dlopen is NOT hooked (SideStore mode or no bypass)");
-        }
-    } else {
-        logMessage(@"Could not resolve dlopen symbol info");
-    }
-
-    void *hook_fn = dlsym(RTLD_DEFAULT, "jitless_hook_dlopen");
-    void *orig_fn = dlsym(RTLD_DEFAULT, "orig_dlopen");
-    logMessage(@"jitless_hook_dlopen=%p, orig_dlopen=%p", hook_fn, orig_fn);
-
-    const char *lcHome = getenv("LC_HOME_PATH");
-    const char *lpHome = getenv("LP_HOME_PATH");
-    const char *tweakEnv = getenv("LC_GLOBAL_TWEAKS_FOLDER");
-    logMessage(@"ENV: LC_HOME_PATH=%s LP_HOME_PATH=%s LC_GLOBAL_TWEAKS_FOLDER=%s",
-        lcHome ?: "(null)", lpHome ?: "(null)", tweakEnv ?: "(null)");
-}
-
-static NSString *findTweaksFolder(void) {
-    const char *envFolder = getenv("LC_GLOBAL_TWEAKS_FOLDER");
-    if (envFolder) {
-        NSString *path = [NSString stringWithUTF8String:envFolder];
-        logMessage(@"Tweaks folder (env): %@", path);
-        return path;
-    }
-
-    const char *lcHome = getenv("LC_HOME_PATH");
-    if (!lcHome) lcHome = getenv("LP_HOME_PATH");
-    if (lcHome) {
-        NSString *home = [NSString stringWithUTF8String:lcHome];
-        NSString *tweaks = [home stringByAppendingPathComponent:@"Tweaks"];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:tweaks]) {
-            logMessage(@"Tweaks folder (LC_HOME): %@", tweaks);
-            return tweaks;
-        }
-        logMessage(@"Tweaks path from LC_HOME does not exist: %@", tweaks);
-    }
-
-    // Walk up from Documents dir to find Tweaks sibling
-    NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    if (docsDir) {
-        NSString *parent = docsDir;
-        for (int i = 0; i < 6; i++) {
-            parent = [parent stringByDeletingLastPathComponent];
-            NSString *tweaks = [parent stringByAppendingPathComponent:@"Tweaks"];
-            if ([[NSFileManager defaultManager] fileExistsAtPath:tweaks]) {
-                logMessage(@"Tweaks folder (traversal): %@", tweaks);
-                return tweaks;
-            }
-        }
-        logMessage(@"Tweaks folder not found by traversal from: %@", docsDir);
-    }
-
-    logMessage(@"ERROR: Could not locate Tweaks folder by any method");
-    return nil;
-}
-
-static BOOL tryDlopen(NSString *path) {
-    void *handle = dlopen(path.UTF8String, RTLD_LAZY | RTLD_GLOBAL);
-    if (handle) {
-        logMessage(@"dlopen succeeded: %@", path);
-        return YES;
-    }
-    const char *err = dlerror();
-    logMessage(@"dlopen failed for %@: %s", path, err ?: "unknown error");
-    return NO;
-}
-
-static BOOL savePayloadToTweaksFolder(NSString *sourcePath) {
-    NSString *tweaksFolder = findTweaksFolder();
-    if (!tweaksFolder) {
-        logMessage(@"ERROR: Cannot save payload - Tweaks folder not found");
-        return NO;
-    }
-
-    NSString *dest = [tweaksFolder stringByAppendingPathComponent:@"DylibLoaderPayload.dylib"];
-    NSFileManager *fm = [NSFileManager defaultManager];
-
-    NSError *rmErr = nil;
-    if ([fm fileExistsAtPath:dest]) {
-        [fm removeItemAtPath:dest error:&rmErr];
-        if (rmErr) {
-            logMessage(@"WARNING: Failed to remove old payload at %@: %@ (code %ld)",
-                dest, rmErr.localizedDescription, (long)rmErr.code);
-        }
-    }
-
-    NSError *copyErr = nil;
-    [fm copyItemAtPath:sourcePath toPath:dest error:&copyErr];
-    if (copyErr) {
-        logMessage(@"ERROR: Failed to copy payload %@ -> %@: %@ (code %ld)",
-            sourcePath, dest, copyErr.localizedDescription, (long)copyErr.code);
-        return NO;
-    }
-
-    NSDictionary *attrs = [fm attributesOfItemAtPath:dest error:nil];
-    logMessage(@"Payload saved to Tweaks: %@ (size: %lld bytes)", dest,
-        [attrs[NSFileSize] longLongValue]);
-    return YES;
-}
-
-static BOOL loadPayloadFromPath(NSString *path) {
-    logMessage(@"Loading payload from: %@", path);
-    logDlopenDiagnostics();
-
-    if (tryDlopen(path)) return YES;
-    logMessage(@"Direct dlopen failed (expected in SideStore/JITLess mode)");
-
-    // Deploy to Tweaks folder for LC to sign on next launch
-    updateStatus(@"Saving to Tweaks...");
-    if (savePayloadToTweaksFolder(path)) {
-        showInfo(@"Restart to activate");
-        updateDetail(@"Close and reopen from\nLiveContainer to activate.");
-        logMessage(@"Payload deployed to Tweaks folder - needs LC relaunch to sign and load");
-        return NO;
-    }
-
-    const char *err = dlerror();
-    logMessage(@"FATAL: All load approaches failed. Last dlerror: %s", err ?: "N/A");
-    showError(@"Load failed", @"Tweaks folder not found.\nCheck LiveContainer setup.");
-    return NO;
-}
-
-// ============================================================================
-// Manifest + version tracking
-// ============================================================================
-
-static NSInteger getLocalVersion(void) {
-    return [[NSUserDefaults standardUserDefaults] integerForKey:VERSION_KEY];
-}
-
-static void setLocalVersion(NSInteger version) {
-    [[NSUserDefaults standardUserDefaults] setInteger:version forKey:VERSION_KEY];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-}
-
-static NSDictionary *fetchManifest(void) {
-    logMessage(@"Fetching manifest from: %@", MANIFEST_URL);
-    NSURL *url = [NSURL URLWithString:MANIFEST_URL];
-    NSURLRequest *req = [NSURLRequest requestWithURL:url
-                                         cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
-                                     timeoutInterval:10.0];
-
-    __block NSData *resultData = nil;
-    __block NSError *resultError = nil;
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:req
-        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-            resultData = data;
-            resultError = error;
-            dispatch_semaphore_signal(sem);
-        }];
-    [task resume];
-
-    long waitResult = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
-    if (waitResult != 0) {
-        logMessage(@"ERROR: Manifest fetch timed out after 10s");
-        return nil;
-    }
-
-    if (resultError) {
-        logMessage(@"ERROR: Manifest fetch failed: domain=%@ code=%ld desc=%@",
-            resultError.domain, (long)resultError.code, resultError.localizedDescription);
-        return nil;
-    }
-    if (!resultData || resultData.length == 0) {
-        logMessage(@"ERROR: Manifest returned empty data");
-        return nil;
-    }
-
-    NSError *parseErr = nil;
-    NSDictionary *json = [NSJSONSerialization JSONObjectWithData:resultData options:0 error:&parseErr];
-    if (parseErr) {
-        logMessage(@"ERROR: Manifest JSON parse failed: %@ (raw: %@)",
-            parseErr.localizedDescription,
-            [[NSString alloc] initWithData:resultData encoding:NSUTF8StringEncoding]);
-        return nil;
-    }
-    if (![json isKindOfClass:[NSDictionary class]]) {
-        logMessage(@"ERROR: Manifest is not a JSON object");
-        return nil;
-    }
-
-    logMessage(@"Manifest fetched: version=%@, url=%@, bundle_id=%@",
-        json[@"version"], json[@"url"], json[@"bundle_id"] ?: @"(any)");
-    return json;
-}
-
-// ============================================================================
-// Download with progress
-// ============================================================================
-
-static BOOL downloadPayloadFromURL(NSString *urlString) {
-    logMessage(@"Starting download from: %@", urlString);
-    updateStatus(@"Connecting...");
-
-    DLDownloadDelegate *delegate = [[DLDownloadDelegate alloc] init];
-    delegate.startTime = CFAbsoluteTimeGetCurrent();
-
-    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-    __block BOOL success = NO;
-
-    delegate.completion = ^(NSURL *location, NSError *error) {
-        if (error) {
-            logMessage(@"Download failed: %@", error.localizedDescription);
-            showError(@"Download failed", error.localizedDescription);
-            dispatch_semaphore_signal(sem);
-            return;
-        }
-
-        updateStatus(@"Saving...");
-        NSError *moveError = nil;
-        [[NSFileManager defaultManager] removeItemAtPath:payloadCachePath error:nil];
-        [[NSFileManager defaultManager] moveItemAtURL:location
-                                                toURL:[NSURL fileURLWithPath:payloadCachePath]
-                                                error:&moveError];
-        if (moveError) {
-            logMessage(@"ERROR: Cache move failed: %@ -> %@: %@ (code %ld)",
-                location.path, payloadCachePath, moveError.localizedDescription, (long)moveError.code);
-            showError(@"Save failed", moveError.localizedDescription);
-            dispatch_semaphore_signal(sem);
-            return;
-        }
-
-        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:payloadCachePath error:nil];
-        logMessage(@"Payload cached: %@ (size: %lld bytes)", payloadCachePath,
-            [attrs[NSFileSize] longLongValue]);
-
-        updateStatus(@"Loading...");
-        if (loadPayloadFromPath(payloadCachePath)) {
-            showSuccess(@"Payload active");
-            success = YES;
-        }
-        dispatch_semaphore_signal(sem);
-    };
-
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-    config.timeoutIntervalForResource = 30.0;
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:config
-                                                          delegate:delegate
-                                                     delegateQueue:nil];
-    NSURLSessionDownloadTask *task = [session downloadTaskWithURL:[NSURL URLWithString:urlString]];
-    [task resume];
-
-    long waitResult = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 35 * NSEC_PER_SEC));
-    [session finishTasksAndInvalidate];
-
-    if (waitResult != 0) {
-        logMessage(@"ERROR: Download timed out after 35s");
-        showError(@"Timeout", @"Download took too long.");
-    }
-
-    if (success) {
-        autoDismiss(1.5);
-    }
-    return success;
 }
 
 // ============================================================================
@@ -853,166 +933,67 @@ __attribute__((constructor))
 static void DylibLoaderInit(void) {
     @autoreleasepool {
         NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-        NSString *docsDir = [paths firstObject];
-
+        docsDir = [paths firstObject];
         logFilePath = [docsDir stringByAppendingPathComponent:LOG_FILENAME];
-        payloadCachePath = [docsDir stringByAppendingPathComponent:PAYLOAD_FILENAME];
+        configFilePath = [docsDir stringByAppendingPathComponent:CONFIG_FILENAME];
 
         logMessage(@"========================================");
-        logMessage(@"DylibLoader starting");
+        logMessage(@"DylibLoader Manager starting");
         logMessage(@"Process: %@ (PID %d)", [[NSProcessInfo processInfo] processName], getpid());
-        logMessage(@"Bundle ID: %@", [[NSBundle mainBundle] bundleIdentifier]);
-        logMessage(@"Documents: %@", docsDir);
-        logMessage(@"Stored payload version: %ld", (long)getLocalVersion());
+        logMessage(@"Bundle: %@", [[NSBundle mainBundle] bundleIdentifier]);
 
-        // Step 1: Try loading existing payload from Tweaks folder
-        NSString *tweaksFolder = findTweaksFolder();
-        NSString *tweaksPayload = tweaksFolder ?
-            [tweaksFolder stringByAppendingPathComponent:@"DylibLoaderPayload.dylib"] : nil;
+        loadConfig();
 
-        BOOL payloadLoaded = NO;
-        if (tweaksPayload && [[NSFileManager defaultManager] fileExistsAtPath:tweaksPayload]) {
-            NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:tweaksPayload error:nil];
-            logMessage(@"Payload exists in Tweaks: %@ (size: %lld)", tweaksPayload,
-                [attrs[NSFileSize] longLongValue]);
-            if (tryDlopen(tweaksPayload)) {
-                logMessage(@"Payload active from Tweaks folder");
-                payloadLoaded = YES;
-            } else {
-                logMessage(@"Payload in Tweaks but dlopen failed (unsigned, needs LC relaunch)");
+        // Process entries immediately (try loading already-signed dylibs from Tweaks)
+        for (DLMEntry *entry in entries) {
+            if (!entry.enabled) continue;
+            NSString *tweaksFolder = findTweaksFolder();
+            if (!tweaksFolder) break;
+            NSString *tweaksPath = [tweaksFolder stringByAppendingPathComponent:[entry tweaksFilename]];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:tweaksPath]) {
+                if (tryDlopen(tweaksPath)) {
+                    entry.status = @"loaded";
+                    logMessage(@"[%@] Loaded from Tweaks at startup", entry.name);
+                    continue;
+                }
+            }
+            // Try cache
+            NSString *cachePath = [docsDir stringByAppendingPathComponent:[entry cacheFilename]];
+            if ([[NSFileManager defaultManager] fileExistsAtPath:cachePath]) {
+                if (tryDlopen(cachePath)) {
+                    entry.status = @"loaded";
+                    logMessage(@"[%@] Loaded from cache at startup", entry.name);
+                }
             }
         }
+        saveConfig();
 
-        // Step 2: Try cached payload as fallback
-        if (!payloadLoaded && [[NSFileManager defaultManager] fileExistsAtPath:payloadCachePath]) {
-            NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:payloadCachePath error:nil];
-            logMessage(@"Cached payload exists: %@ (size: %lld)", payloadCachePath,
-                [attrs[NSFileSize] longLongValue]);
-            if (tryDlopen(payloadCachePath)) {
-                logMessage(@"Payload active from cache");
-                payloadLoaded = YES;
-            }
-        }
-
-        // Step 3: Deferred manifest check + update (after UI is ready)
+        // Deferred: show UI + check for updates
         [[NSNotificationCenter defaultCenter]
             addObserverForName:@"UIApplicationDidFinishLaunchingNotification"
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(NSNotification *note) {
+            createFloatingPanel();
 
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                NSDictionary *manifest = fetchManifest();
-                if (!manifest) {
-                    if (payloadLoaded) {
-                        logMessage(@"Manifest unreachable but payload is active - continuing");
-                    } else {
-                        logMessage(@"Manifest unreachable and no payload loaded");
-                        dispatch_async(dispatch_get_main_queue(), ^{
-                            createFloatingPanel();
-                            showError(@"Server unreachable", @"No cached payload available.");
-                        });
-                    }
-                    logMessage(@"========================================");
-                    return;
+                NSArray *snapshot = nil;
+                @synchronized(entries) {
+                    snapshot = [entries copy];
                 }
-
-                // Per-app bundle_id filter
-                NSString *targetBundle = manifest[@"bundle_id"];
-                if (targetBundle && [targetBundle isKindOfClass:[NSString class]] && targetBundle.length > 0) {
-                    NSString *currentBundle = [[NSBundle mainBundle] bundleIdentifier];
-                    if (![targetBundle isEqualToString:currentBundle]) {
-                        logMessage(@"Bundle filter: target=%@ current=%@ - skipping", targetBundle, currentBundle);
-                        logMessage(@"========================================");
-                        return;
-                    }
-                    logMessage(@"Bundle filter matched: %@", currentBundle);
+                BOOL anyChanged = NO;
+                for (DLMEntry *entry in snapshot) {
+                    if ([entry.status isEqualToString:@"loaded"]) continue;
+                    processEntry(entry);
+                    anyChanged = YES;
                 }
-
-                NSInteger remoteVersion = 0;
-                id versionVal = manifest[@"version"];
-                if ([versionVal isKindOfClass:[NSNumber class]]) {
-                    remoteVersion = [versionVal integerValue];
+                if (anyChanged) {
+                    saveConfig();
+                    dispatch_async(dispatch_get_main_queue(), ^{ rebuildUI(); });
                 }
-                NSString *downloadURL = nil;
-                id urlVal = manifest[@"url"];
-                if ([urlVal isKindOfClass:[NSString class]] && [urlVal length] > 0) {
-                    downloadURL = urlVal;
-                }
-                NSInteger localVersion = getLocalVersion();
-
-                // Up to date and loaded
-                if (remoteVersion <= localVersion && payloadLoaded) {
-                    logMessage(@"Payload up to date (v%ld) and active", (long)localVersion);
-                    [[NSUserDefaults standardUserDefaults] setInteger:0 forKey:restartCountKey];
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        createFloatingPanel();
-                        showSuccess(@"Payload active");
-                        updateDetail([NSString stringWithFormat:@"v%ld - up to date", (long)localVersion]);
-                        autoDismiss(1.5);
-                    });
-                    logMessage(@"========================================");
-                    return;
-                }
-
-                // Version matches but not loaded (needs signing)
-                if (remoteVersion <= localVersion && !payloadLoaded) {
-                    NSInteger restarts = [[NSUserDefaults standardUserDefaults] integerForKey:restartCountKey];
-                    restarts++;
-                    [[NSUserDefaults standardUserDefaults] setInteger:restarts forKey:restartCountKey];
-                    [[NSUserDefaults standardUserDefaults] synchronize];
-
-                    logMessage(@"Payload v%ld present but not loaded (attempt %ld)", (long)localVersion, (long)restarts);
-
-                    if ([[NSFileManager defaultManager] fileExistsAtPath:payloadCachePath] && tweaksFolder) {
-                        savePayloadToTweaksFolder(payloadCachePath);
-                    }
-
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        createFloatingPanel();
-                        if (restarts >= 3) {
-                            showError(@"Signing may have failed",
-                                @"Payload was not signed after\nmultiple restarts.\n\nCheck LC certificate settings.");
-                        } else {
-                            showInfo(@"Restart to activate");
-                            updateDetail(@"Close and reopen from\nLiveContainer to activate.");
-                        }
-                    });
-                    logMessage(@"========================================");
-                    return;
-                }
-
-                // New version available
-                logMessage(@"Update available: v%ld -> v%ld", (long)localVersion, (long)remoteVersion);
-                if (!downloadURL) {
-                    logMessage(@"ERROR: Manifest has no valid download URL");
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        createFloatingPanel();
-                        showError(@"Invalid manifest", @"No download URL provided.");
-                    });
-                    logMessage(@"========================================");
-                    return;
-                }
-
-                dispatch_async(dispatch_get_main_queue(), ^{
-                    createFloatingPanel();
-                    updateStatus([NSString stringWithFormat:@"Updating to v%ld...", (long)remoteVersion]);
-                });
-                // Brief delay so UI can render before download blocks
-                [NSThread sleepForTimeInterval:0.1];
-
-                BOOL downloaded = downloadPayloadFromURL(downloadURL);
-
-                if (downloaded) {
-                    setLocalVersion(remoteVersion);
-                    logMessage(@"Version stored: %ld", (long)remoteVersion);
-                } else {
-                    logMessage(@"Download failed, version not updated");
-                }
-                logMessage(@"========================================");
             });
         }];
 
-        logMessage(@"Deferred manifest check registered");
+        logMessage(@"Manager initialized with %lu entries", (unsigned long)entries.count);
     }
 }
