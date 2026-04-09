@@ -36,10 +36,12 @@ static void showLoadedAlert(void) {
         id presenter = nil;
 
         for (id scene in scenes) {
-            // Check if it's a UIWindowScene
             if (![(NSObject *)scene isKindOfClass:objc_getClass("UIWindowScene")]) continue;
             id windows = ((id (*)(id, SEL))objc_msgSend)(scene, sel_registerName("windows"));
             for (id window in windows) {
+                // Skip windows with elevated windowLevel (e.g., DylibLoader's floating panel)
+                CGFloat level = ((CGFloat (*)(id, SEL))objc_msgSend)(window, sel_registerName("windowLevel"));
+                if (level > 1.0) continue;
                 BOOL isKey = ((BOOL (*)(id, SEL))objc_msgSend)(window, sel_registerName("isKeyWindow"));
                 if (isKey) {
                     presenter = ((id (*)(id, SEL))objc_msgSend)(window, sel_registerName("rootViewController"));
@@ -47,6 +49,21 @@ static void showLoadedAlert(void) {
                 }
             }
             if (presenter) break;
+        }
+
+        // Fallback: find any normal-level window with a rootViewController
+        if (!presenter) {
+            for (id scene in scenes) {
+                if (![(NSObject *)scene isKindOfClass:objc_getClass("UIWindowScene")]) continue;
+                id windows = ((id (*)(id, SEL))objc_msgSend)(scene, sel_registerName("windows"));
+                for (id window in windows) {
+                    CGFloat level = ((CGFloat (*)(id, SEL))objc_msgSend)(window, sel_registerName("windowLevel"));
+                    if (level > 1.0) continue;
+                    id vc = ((id (*)(id, SEL))objc_msgSend)(window, sel_registerName("rootViewController"));
+                    if (vc) { presenter = vc; break; }
+                }
+                if (presenter) break;
+            }
         }
 
         if (presenter) {

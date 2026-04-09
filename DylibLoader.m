@@ -49,6 +49,7 @@
 
 static NSString *logFilePath = nil;
 static NSString *payloadCachePath = nil;
+static NSString *restartCountKey = @"DylibLoaderRestartCount";
 
 static id floatingWindow = nil;
 static id statusLabel = nil;
@@ -943,6 +944,7 @@ static void DylibLoaderInit(void) {
                 // Up to date and loaded
                 if (remoteVersion <= localVersion && payloadLoaded) {
                     logMessage(@"Payload up to date (v%ld) and active", (long)localVersion);
+                    [[NSUserDefaults standardUserDefaults] setInteger:0 forKey:restartCountKey];
                     dispatch_async(dispatch_get_main_queue(), ^{
                         createFloatingPanel();
                         showSuccess(@"Payload active");
@@ -955,14 +957,26 @@ static void DylibLoaderInit(void) {
 
                 // Version matches but not loaded (needs signing)
                 if (remoteVersion <= localVersion && !payloadLoaded) {
-                    logMessage(@"Payload v%ld downloaded but not loaded (needs LC signing)", (long)localVersion);
+                    NSInteger restarts = [[NSUserDefaults standardUserDefaults] integerForKey:restartCountKey];
+                    restarts++;
+                    [[NSUserDefaults standardUserDefaults] setInteger:restarts forKey:restartCountKey];
+                    [[NSUserDefaults standardUserDefaults] synchronize];
+
+                    logMessage(@"Payload v%ld present but not loaded (attempt %ld)", (long)localVersion, (long)restarts);
+
                     if ([[NSFileManager defaultManager] fileExistsAtPath:payloadCachePath] && tweaksFolder) {
                         savePayloadToTweaksFolder(payloadCachePath);
                     }
+
                     dispatch_async(dispatch_get_main_queue(), ^{
                         createFloatingPanel();
-                        showInfo(@"Restart to activate");
-                        updateDetail(@"Close and reopen from\nLiveContainer to activate.");
+                        if (restarts >= 3) {
+                            showError(@"Signing may have failed",
+                                @"Payload was not signed after\nmultiple restarts.\n\nCheck LC certificate settings.");
+                        } else {
+                            showInfo(@"Restart to activate");
+                            updateDetail(@"Close and reopen from\nLiveContainer to activate.");
+                        }
                     });
                     logMessage(@"========================================");
                     return;
