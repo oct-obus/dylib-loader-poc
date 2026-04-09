@@ -404,63 +404,228 @@ didCompleteWithError:(NSError *)error {
 @end
 
 // ============================================================================
-// Payload loading — tries LC's dlopen_nolock first, falls back to dlopen
+// ZSign integration — sign downloaded dylibs at runtime
 // ============================================================================
 
-// LiveContainer exports dlopen_nolock() which routes through its JITLess
-// hook (if active). Our own GOT entry for dlopen may not be patched
-// because we were loaded after LC's rebind pass.
+// LC loads ZSign.dylib with RTLD_GLOBAL, making ZSigner class available.
+// We can ad-hoc sign a single Mach-O, or fully sign with LC's P12 cert.
+
+static BOOL ensureZSignLoaded(void) {
+    if (NSClassFromString(@"ZSigner")) return YES;
+
+    // ZSign.dylib might not be loaded yet — try loading it from Frameworks/
+    NSString *fwPath = [NSBundle.mainBundle.bundlePath
+        stringByAppendingPathComponent:@"Frameworks/ZSign.dylib"];
+    logMessage(@"Loading ZSign from: %@", fwPath);
+    void *handle = dlopen(fwPath.UTF8String, RTLD_GLOBAL);
+    if (handle && NSClassFromString(@"ZSigner")) {
+        logMessage(@"ZSign loaded successfully");
+        return YES;
+    }
+    logMessage(@"ZSign not available (handle=%p, class=%p)", handle, NSClassFromString(@"ZSigner"));
+    return NO;
+}
+
+static BOOL signPayloadAdhoc(NSString *path) {
+    if (!ensureZSignLoaded()) return NO;
+
+    Class ZSigner = NSClassFromString(@"ZSigner");
+    SEL sel = NSSelectorFromString(@"adhocSignMachOAtPath:bundleId:entitlementData:");
+    if (![ZSigner respondsToSelector:sel]) {
+        logMessage(@"ZSigner missing adhocSignMachO selector");
+        return NO;
+    }
+
+    NSString *bundleId = [[NSBundle mainBundle] bundleIdentifier] ?: @"com.dylib-loader.payload";
+
+    // Minimal entitlements plist
+    NSDictionary *entDict = @{};
+    NSData *entData = [NSPropertyListSerialization dataWithPropertyList:entDict
+                                                                format:NSPropertyListXMLFormat_v1_0
+                                                               options:0
+                                                                 error:nil];
+
+    logMessage(@"Ad-hoc signing %@ with bundleId=%@", path, bundleId);
+    BOOL result = ((BOOL (*)(Class, SEL, NSString*, NSString*, NSData*))objc_msgSend)(
+        ZSigner, sel, path, bundleId, entData
+    );
+    logMessage(@"Ad-hoc sign result: %@", result ? @"SUCCESS" : @"FAILED");
+    return result;
+}
+
+static BOOL signPayloadWithCert(NSString *path) {
+    if (!ensureZSignLoaded()) return NO;
+
+    // Get certificate data from LC's shared NSUserDefaults
+    Class LCSharedUtils = NSClassFromString(@"LCSharedUtils");
+    NSString *appGroupID = nil;
+    SEL groupSel = NSSelectorFromString(@"appGroupID");
+    if (LCSharedUtils && [LCSharedUtils respondsToSelector:groupSel]) {
+        appGroupID = ((NSString *(*)(Class, SEL))objc_msgSend)(LCSharedUtils, groupSel);
+    }
+
+    NSUserDefaults *shared = appGroupID
+        ? [[NSUserDefaults alloc] initWithSuiteName:appGroupID]
+        : [NSUserDefaults standardUserDefaults];
+
+    NSData *certData = [shared objectForKey:@"LCCertificateData"];
+    NSString *certPass = [shared objectForKey:@"LCCertificatePassword"];
+    if (!certData || !certPass) {
+        logMessage(@"No certificate data available (certData=%p, certPass=%p)", certData, certPass);
+        // Also try standard defaults as fallback
+        certData = certData ?: [[NSUserDefaults standardUserDefaults] objectForKey:@"LCCertificateData"];
+        certPass = certPass ?: [[NSUserDefaults standardUserDefaults] objectForKey:@"LCCertificatePassword"];
+        if (!certData || !certPass) return NO;
+    }
+
+    NSData *provData = [NSData dataWithContentsOfURL:
+        [[NSBundle mainBundle] URLForResource:@"embedded" withExtension:@"mobileprovision"]];
+    if (!provData) {
+        logMessage(@"No provisioning profile found");
+        return NO;
+    }
+
+    logMessage(@"Signing with cert (%lu bytes), pass=***, prov=%lu bytes",
+        (unsigned long)certData.length, (unsigned long)provData.length);
+
+    // Use ZSigner's full signing — wrap the dylib in a temp .app structure
+    NSString *tmpDir = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"zsign_%u", arc4random()]];
+    NSString *tmpApp = [tmpDir stringByAppendingPathComponent:@"Payload.app"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    [fm createDirectoryAtPath:tmpApp withIntermediateDirectories:YES attributes:nil error:nil];
+
+    NSString *tmpDylib = [tmpApp stringByAppendingPathComponent:path.lastPathComponent];
+    NSError *copyErr = nil;
+    [fm copyItemAtPath:path toPath:tmpDylib error:&copyErr];
+    if (copyErr) {
+        logMessage(@"Failed to copy for signing: %@", copyErr);
+        [fm removeItemAtPath:tmpDir error:nil];
+        return NO;
+    }
+
+    // Create a minimal Info.plist so ZSign treats it as a valid app
+    NSDictionary *info = @{
+        @"CFBundleIdentifier": [[NSBundle mainBundle] bundleIdentifier] ?: @"com.dylib-loader.payload",
+        @"CFBundleExecutable": path.lastPathComponent
+    };
+    [info writeToFile:[tmpApp stringByAppendingPathComponent:@"Info.plist"] atomically:YES];
+
+    // Call ZSigner signWithAppPath:prov:key:pass:completionHandler:
+    Class ZSigner = NSClassFromString(@"ZSigner");
+    SEL signSel = NSSelectorFromString(@"signWithAppPath:prov:key:pass:completionHandler:");
+
+    if (![ZSigner respondsToSelector:signSel]) {
+        logMessage(@"ZSigner missing signWithAppPath selector");
+        [fm removeItemAtPath:tmpDir error:nil];
+        return NO;
+    }
+
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block BOOL signSuccess = NO;
+
+    void (^completionBlock)(BOOL, NSError *) = ^(BOOL success, NSError *error) {
+        if (success) {
+            logMessage(@"Full signing succeeded");
+            signSuccess = YES;
+        } else {
+            logMessage(@"Full signing failed: %@", error);
+        }
+        dispatch_semaphore_signal(sem);
+    };
+
+    ((id (*)(Class, SEL, NSString*, NSData*, NSData*, NSString*, id))objc_msgSend)(
+        ZSigner, signSel,
+        tmpApp, provData, certData, certPass, completionBlock
+    );
+
+    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+
+    if (signSuccess) {
+        // Copy the signed dylib back
+        [fm removeItemAtPath:path error:nil];
+        NSError *moveErr = nil;
+        [fm moveItemAtPath:tmpDylib toPath:path error:&moveErr];
+        if (moveErr) {
+            logMessage(@"Failed to move signed dylib back: %@", moveErr);
+            signSuccess = NO;
+        }
+    }
+
+    [fm removeItemAtPath:tmpDir error:nil];
+    return signSuccess;
+}
+
+// ============================================================================
+// Payload loading — sign → dlopen_nolock → dlopen
+// ============================================================================
+
 typedef void *(*dlopen_func_t)(const char *, int);
 static dlopen_func_t resolve_dlopen_nolock(void) {
-    void *handle = dlopen(NULL, RTLD_NOW); // get main image handle
+    void *handle = dlopen(NULL, RTLD_NOW);
     if (!handle) return NULL;
     void *sym = dlsym(handle, "dlopen_nolock");
-    if (sym) {
-        logMessage(@"Found LC's dlopen_nolock at %p", sym);
-    }
+    if (sym) logMessage(@"Found LC's dlopen_nolock at %p", sym);
     return (dlopen_func_t)sym;
+}
+
+static BOOL tryDlopen(NSString *path) {
+    const char *cpath = path.UTF8String;
+    void *handle = NULL;
+
+    // Try 1: LC's dlopen_nolock (handles GOT-not-patched issue)
+    dlopen_func_t dl_nolock = resolve_dlopen_nolock();
+    if (dl_nolock) {
+        handle = dl_nolock(cpath, RTLD_LAZY | RTLD_GLOBAL);
+        if (handle) {
+            logMessage(@"SUCCESS via dlopen_nolock");
+            return YES;
+        }
+        logMessage(@"dlopen_nolock failed: %s", dlerror() ?: "unknown");
+    }
+
+    // Try 2: Standard dlopen
+    handle = dlopen(cpath, RTLD_LAZY | RTLD_GLOBAL);
+    if (handle) {
+        logMessage(@"SUCCESS via dlopen");
+        return YES;
+    }
+    logMessage(@"dlopen failed: %s", dlerror() ?: "unknown");
+    return NO;
 }
 
 static BOOL loadPayloadFromPath(NSString *path) {
     logMessage(@"Attempting to load: %@", path);
 
-    void *handle = NULL;
-    const char *cpath = path.UTF8String;
+    // Step 1: Try loading directly (works if JIT enabled or already signed)
+    if (tryDlopen(path)) return YES;
 
-    // Try 1: LC's dlopen_nolock (works even if our GOT wasn't patched)
-    dlopen_func_t dl_nolock = resolve_dlopen_nolock();
-    if (dl_nolock) {
-        logMessage(@"Trying dlopen_nolock...");
-        handle = dl_nolock(cpath, RTLD_LAZY | RTLD_GLOBAL);
-        if (handle) {
-            logMessage(@"SUCCESS via dlopen_nolock: %@", path);
-            return YES;
-        }
-        const char *err = dlerror();
-        logMessage(@"dlopen_nolock failed: %s", err ? err : "unknown");
+    // Step 2: Try ad-hoc signing first (no cert needed)
+    logMessage(@"Direct load failed — trying to sign the payload...");
+    updateOverlayStatus(@"Signing payload (ad-hoc)...");
+    if (signPayloadAdhoc(path)) {
+        logMessage(@"Ad-hoc signed, retrying load...");
+        if (tryDlopen(path)) return YES;
+        logMessage(@"Ad-hoc signed payload still rejected");
     }
 
-    // Try 2: Standard dlopen (works in JIT mode where dyld is patched)
-    logMessage(@"Trying standard dlopen...");
-    handle = dlopen(cpath, RTLD_LAZY | RTLD_GLOBAL);
-    if (handle) {
-        logMessage(@"SUCCESS via dlopen: %@", path);
-        return YES;
+    // Step 3: Try full signing with LC's certificate
+    updateOverlayStatus(@"Signing with LC cert...");
+    if (signPayloadWithCert(path)) {
+        logMessage(@"Cert-signed, retrying load...");
+        if (tryDlopen(path)) return YES;
+        logMessage(@"Cert-signed payload still rejected");
     }
 
+    // All approaches failed
     const char *err = dlerror();
     NSString *errStr = err ? [NSString stringWithUTF8String:err] : @"unknown error";
-    logMessage(@"FAILED: %@", errStr);
+    logMessage(@"ALL LOAD ATTEMPTS FAILED: %@", errStr);
 
-    // Provide user-friendly diagnosis
     if ([errStr containsString:@"code signature"]) {
-        logMessage(@"DIAGNOSIS: The payload dylib is not signed with the correct certificate.");
-        logMessage(@"In JITLess mode, downloaded dylibs MUST be signed with LiveContainer's");
-        logMessage(@"certificate before dlopen. In JIT mode, this should work automatically.");
-        logMessage(@"Solutions: 1) Enable JIT (AltJIT/SideJIT), 2) Sign payload with LC's cert");
-        showOverlayError(@"Code signature invalid\n\nJITLess mode requires signed dylibs.\nEnable JIT or sign the payload\nwith LiveContainer's certificate.");
+        showOverlayError(@"Code signature invalid\n\nCouldn't sign payload.\nZSign or cert data unavailable.");
     } else {
-        showOverlayError([NSString stringWithFormat:@"dlopen failed:\n%@", errStr]);
+        showOverlayError([NSString stringWithFormat:@"Load failed:\n%@", errStr]);
     }
     return NO;
 }
